@@ -21,7 +21,7 @@ _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QPushButton, QLabel, QFileDialog, QHeaderView,
-    QAbstractItemView, QSplitter, QFrame,
+    QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
@@ -165,6 +165,61 @@ def _scan_blob_for_parent_uids(raw: bytes, uid_set: frozenset, self_uid: int) ->
     return 0, 0
 
 
+# ── Visual mutation scanner ───────────────────────────────────────────────────
+
+# 14 body-part slots (0-indexed); slot_id ≥ 300 in the blob = active mutation
+VISUAL_MUT_NAMES = [
+    "Body", "Head", "Tail", "Eye", "Ear",
+    "Leg", "Paw", "Belly", "Back", "Fur",
+    "Wing", "Horn", "Fang", "Mark",
+]
+
+def _find_mutation_table(raw: bytes) -> int:
+    """
+    Locate the 296-byte visual-mutation table by scanning for its header:
+      entry-0: f32 scale [0.05, 20.0], u32 coat_id [1, 20000], u32 small ≤ 500,
+               u32 sentinel (0 or ≤ 5000)
+      entries 1-14: 20 bytes each, second u32 (coat_id or 0) validated for ≥10 slots.
+    Returns base offset, or -1 if not found.
+    """
+    size = 16 + 14 * 20   # 296 bytes
+    limit = len(raw) - size
+    for base in range(limit):
+        scale = struct.unpack_from('<f', raw, base)[0]
+        if not (0.05 <= scale <= 20.0):
+            continue
+        coat = struct.unpack_from('<I', raw, base + 4)[0]
+        if coat == 0 or coat > 20_000:
+            continue
+        t1 = struct.unpack_from('<I', raw, base + 8)[0]
+        if t1 > 500:
+            continue
+        t2 = struct.unpack_from('<I', raw, base + 12)[0]
+        if t2 != 0xFFFF_FFFF and t2 > 5_000:
+            continue
+        matches = sum(
+            1 for i in range(14)
+            if struct.unpack_from('<I', raw, base + 16 + i * 20 + 4)[0] in (coat, 0)
+        )
+        if matches >= 10:
+            return base
+    return -1
+
+
+def _read_visual_mutations(raw: bytes) -> list:
+    """Return list of active visual-mutation names (e.g. 'Eye Mutation')."""
+    base = _find_mutation_table(raw)
+    if base == -1:
+        return []
+    result = []
+    for i in range(14):
+        slot_id = struct.unpack_from('<I', raw, base + 16 + i * 20)[0]
+        if slot_id >= 300:
+            name = VISUAL_MUT_NAMES[i] if i < len(VISUAL_MUT_NAMES) else f"Mutation{i+1}"
+            result.append(f"{name} Mutation")
+    return result
+
+
 # ── Cat ───────────────────────────────────────────────────────────────────────
 
 class Cat:
@@ -196,6 +251,7 @@ class Cat:
         self._uid_int = r.u64()            # cat's own unique id (seed)
         self.unique_id = hex(self._uid_int)
         self.name = r.utf16str()
+        _name_end = r.pos   # used below for reliable sex u16 read at _name_end+8
 
         r.str()  # unknown string between name and parent refs
 
@@ -329,6 +385,22 @@ class Cat:
                 p = r.str()
                 if _valid_str(p):
                     self.mutations.append(p)
+
+        # Visual mutations from the 296-byte fixed mutation table (prepend so they
+        # show first; passive trait strings from the ability run follow)
+        vis = _read_visual_mutations(raw)
+        if vis:
+            self.mutations = vis + self.mutations
+
+        # Gender override: read sex u16 at _name_end+8 (from blob format research).
+        # Mapping: 0 = ditto/unknown, 1 = male, 2 = female.
+        # This supersedes the unreliable deep-blob string read, which mis-classifies
+        # ditto cats as "female" when the blob happens to contain that string later.
+        try:
+            sex_u16 = struct.unpack_from('<H', raw, _name_end + 8)[0]
+            self.gender = {1: "male", 2: "female"}.get(sex_u16, "?")
+        except Exception:
+            pass  # keep string-based fallback
 
     # ── Display helpers ────────────────────────────────────────────────────
 
@@ -790,6 +862,13 @@ class CatDetailPanel(QWidget):
             dl.setStyleSheet("color:#5a9; font-size:11px;")
             id_col.addWidget(dl)
 
+        tree_btn = QPushButton("Family Tree…")
+        tree_btn.setStyleSheet(
+            "QPushButton { color:#5a8aaa; background:transparent; border:1px solid #252545;"
+            " padding:3px 8px; border-radius:4px; font-size:10px; }"
+            "QPushButton:hover { background:#131328; }")
+        tree_btn.clicked.connect(lambda: LineageDialog(cat, self).exec())
+        id_col.addWidget(tree_btn)
         id_col.addStretch()
         root.addLayout(id_col)
 
@@ -865,7 +944,6 @@ class CatDetailPanel(QWidget):
     # ── Breeding pair ──────────────────────────────────────────────────────
 
     def _build_pair(self, a: Cat, b: Cat):
-        from PySide6.QtWidgets import QGridLayout, QSizePolicy
         ok, reason = can_breed(a, b)
 
         root = QVBoxLayout(self._content)
@@ -926,6 +1004,11 @@ class CatDetailPanel(QWidget):
             h.setStyleSheet("color:#555; font-size:9px; font-weight:bold;")
             h.setAlignment(Qt.AlignCenter)
             grid.addWidget(h, 0, j + 1)
+        sum_col = len(STAT_NAMES) + 1
+        sh = QLabel("Sum")
+        sh.setStyleSheet("color:#455; font-size:9px; font-weight:bold;")
+        sh.setAlignment(Qt.AlignCenter)
+        grid.addWidget(sh, 0, sum_col)
 
         for i, (cat, is_cat) in enumerate(grid_rows):
             row_num = i + 1
@@ -977,6 +1060,19 @@ class CatDetailPanel(QWidget):
                         f"color:rgb({c.red()},{c.green()},{c.blue()});"
                         f"font-size:11px; font-weight:bold;")
                 grid.addWidget(cell, row_num, j + 1)
+
+            # Sum cell
+            if is_cat:
+                sv = sum(cat.base_stats.values())
+                sc = QLabel(str(sv))
+                sc.setStyleSheet("color:#aaa; font-size:11px; font-weight:bold;")
+            else:
+                lo_s = sum(min(a.base_stats[st], b.base_stats[st]) for st in STAT_NAMES)
+                hi_s = sum(max(a.base_stats[st], b.base_stats[st]) for st in STAT_NAMES)
+                sc = QLabel(f"{lo_s}–{hi_s}" if lo_s != hi_s else str(lo_s))
+                sc.setStyleSheet("color:#777; font-size:11px; font-weight:bold;")
+            sc.setAlignment(Qt.AlignCenter)
+            grid.addWidget(sc, row_num, sum_col)
 
         mid.addWidget(grid_w)
         mid.addWidget(_vsep())
@@ -1046,6 +1142,93 @@ class CatDetailPanel(QWidget):
         bot.addStretch()
 
         root.addLayout(bot)
+
+
+# ── Lineage tree dialog ───────────────────────────────────────────────────────
+
+class LineageDialog(QDialog):
+    """Modal dialog showing up to 3 generations of ancestry for a single cat."""
+
+    def __init__(self, cat: 'Cat', parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Family Tree — {cat.name}")
+        self.setMinimumSize(640, 320)
+        self.setStyleSheet(
+            "QDialog { background:#0a0a18; }"
+            "QPushButton { background:#1e1e38; color:#ccc; border:1px solid #2a2a4a;"
+            " padding:5px 14px; border-radius:4px; font-size:11px; }"
+            "QPushButton:hover { background:#252555; }"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 16)
+        layout.setSpacing(16)
+
+        # Generation labels on the left
+        gen_col = QVBoxLayout()
+        gen_col.setSpacing(0)
+
+        def gen_label(text):
+            l = QLabel(text)
+            l.setStyleSheet("color:#333; font-size:9px; font-weight:bold; letter-spacing:1px;")
+            l.setFixedHeight(60)
+            l.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            return l
+
+        def cat_box(cat_obj, highlight=False):
+            if cat_obj is None:
+                lbl = QLabel("Unknown")
+                lbl.setStyleSheet(
+                    "color:#2a2a3a; font-size:10px; padding:8px 10px;"
+                    " background:#0d0d1c; border:1px solid #16162a; border-radius:5px;")
+            else:
+                parts = [f"<b>{cat_obj.name}</b>", cat_obj.gender_display]
+                if cat_obj.room_display:
+                    parts.append(cat_obj.room_display)
+                text = "  ·  ".join(parts)
+                bg     = "#1a2840" if highlight else "#121222"
+                border = "#3060a0" if highlight else "#222238"
+                lbl = QLabel(text)
+                lbl.setStyleSheet(
+                    f"color:#ddd; font-size:10px; padding:8px 10px;"
+                    f" background:{bg}; border:1px solid {border}; border-radius:5px;")
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setWordWrap(True)
+            lbl.setFixedHeight(54)
+            lbl.setMinimumWidth(120)
+            return lbl
+
+        # 4-column grid; each generation halves the column span
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(16)
+
+        # Row 0 — focus cat (center, spans cols 1-2 of 4)
+        grid.addWidget(cat_box(cat, highlight=True), 0, 1, 1, 2)
+
+        # Row 1 — parents
+        pa, pb = cat.parent_a, cat.parent_b
+        grid.addWidget(cat_box(pa), 1, 0, 1, 2)
+        grid.addWidget(cat_box(pb), 1, 2, 1, 2)
+
+        # Row 2 — grandparents (one per column)
+        for parent, start in ((pa, 0), (pb, 2)):
+            gp_a = parent.parent_a if parent else None
+            gp_b = parent.parent_b if parent else None
+            grid.addWidget(cat_box(gp_a), 2, start)
+            grid.addWidget(cat_box(gp_b), 2, start + 1)
+
+        layout.addLayout(grid)
+
+        # Gen labels overlay (simple side column alternative)
+        for row, label in enumerate(["You", "Parents", "Grandparents"]):
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color:#2a2a3a; font-size:9px; letter-spacing:1px;")
+            grid.addWidget(lbl, row, 4)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
 
 
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
