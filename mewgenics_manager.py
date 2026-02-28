@@ -384,16 +384,17 @@ def find_save_files() -> list[str]:
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS  = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Mutations"]
+COLUMNS  = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Mutations", "Abilities"]
 COL_NAME = 0
 COL_GEN  = 1
 COL_ROOM = 2
 COL_STAT = 3
 STAT_COLS = list(range(4, 11))   # STR … LCK  (indices 4–10)
 COL_MUTS = 11
+COL_ABIL = 12
 
 # Fixed pixel widths for narrow columns
-_W_STATUS = 46
+_W_STATUS = 62
 _W_STAT   = 34
 _W_GEN    = 28
 
@@ -431,6 +432,8 @@ class CatTableModel(QAbstractTableModel):
                 return str(cat.base_stats[STAT_NAMES[col - 4]])
             if col == COL_MUTS:
                 return ", ".join(cat.mutations)
+            if col == COL_ABIL:
+                return ", ".join(cat.abilities)
 
         elif role == Qt.UserRole:
             if col in STAT_COLS:
@@ -459,6 +462,8 @@ class CatTableModel(QAbstractTableModel):
                 return cat.room
             if col == COL_MUTS and cat.mutations:
                 return "\n".join(cat.mutations)
+            if col == COL_ABIL and cat.abilities:
+                return "\n".join(cat.abilities)
 
         elif role == Qt.TextAlignmentRole:
             if col in STAT_COLS or col in (COL_GEN, COL_STAT):
@@ -1000,8 +1005,9 @@ class MainWindow(QMainWindow):
         hh = self._table.horizontalHeader()
         # Default: resize to contents
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        # Mutations column stretches
+        # Mutations and Abilities columns share the remaining space equally
         hh.setSectionResizeMode(COL_MUTS, QHeaderView.Stretch)
+        hh.setSectionResizeMode(COL_ABIL, QHeaderView.Stretch)
         # Narrow fixed columns
         for col, width in [(COL_GEN, _W_GEN), (COL_STAT, _W_STATUS)] + \
                           [(c, _W_STAT) for c in STAT_COLS]:
