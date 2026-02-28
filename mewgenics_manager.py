@@ -289,8 +289,9 @@ class Cat:
         # Relationship scaffolds — resolved by parse_save after all cats loaded.
         self._lover_uids: list[int] = []
         self._hater_uids: list[int] = []
-        self.lovers: list['Cat'] = []
-        self.haters: list['Cat'] = []
+        self.lovers:   list['Cat'] = []
+        self.haters:   list['Cat'] = []
+        self.children: list['Cat'] = []   # direct offspring; assigned by parse_save
 
         # ── Ability run — anchored on "DefaultMove" ─────────────────────────
         # The ability block is a u64-length-prefixed ASCII identifier run.
@@ -550,11 +551,49 @@ def _get_adventure_keys(conn) -> set:
     return keys
 
 
+def _parse_pedigree(conn) -> tuple[dict, dict]:
+    """
+    Parse the pedigree blob from the files table.
+    Each 32-byte entry: u64 cat_key, u64 parent_a_key, u64 parent_b_key, u64 extra.
+    0xFFFFFFFFFFFFFFFF means null/unknown for parent fields.
+    Returns (ped_map, children_map):
+        ped_map:      db_key -> (parent_a_key | None, parent_b_key | None)
+        children_map: db_key -> [child_db_keys]
+    """
+    try:
+        row = conn.execute("SELECT data FROM files WHERE key='pedigree'").fetchone()
+        if not row:
+            return {}, {}
+        data = row[0]
+    except Exception:
+        return {}, {}
+
+    NULL = 0xFFFF_FFFF_FFFF_FFFF
+    MAX_KEY = 1_000_000   # anything larger is a legacy UID or garbage
+    ped_map: dict = {}
+    children_map: dict = {}
+
+    # Entries start at offset 8 (after a single u64 header), stride 32
+    for pos in range(8, len(data) - 31, 32):
+        cat_k, pa_k, pb_k, _ = struct.unpack_from('<QQQQ', data, pos)
+        if cat_k == 0 or cat_k == NULL or cat_k > MAX_KEY:
+            continue
+        pa = int(pa_k) if pa_k != NULL and 0 < pa_k <= MAX_KEY else None
+        pb = int(pb_k) if pb_k != NULL and 0 < pb_k <= MAX_KEY else None
+        ped_map[int(cat_k)] = (pa, pb)
+        for parent_key in (pa, pb):
+            if parent_key is not None:
+                children_map.setdefault(parent_key, []).append(int(cat_k))
+
+    return ped_map, children_map
+
+
 def parse_save(path: str) -> tuple[list, list]:
     conn  = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     house = _get_house_info(conn)
     adv   = _get_adventure_keys(conn)
     rows  = conn.execute("SELECT key, data FROM cats").fetchall()
+    ped_map, children_map = _parse_pedigree(conn)
     conn.close()
 
     cats, errors = [], []
@@ -564,24 +603,37 @@ def parse_save(path: str) -> tuple[list, list]:
         except Exception as e:
             errors.append((key, str(e)))
 
-    # Build UID lookup
-    uid_map = {c._uid_int: c for c in cats}
+    # Fast lookups
+    key_to_cat: dict = {c.db_key: c for c in cats}
+    uid_map:    dict = {c._uid_int: c for c in cats}
     uid_set = frozenset(uid_map.keys()) - {0}
 
-    # Two-pass parent resolution:
-    #   1st pass: try fixed-position UIDs read during parsing
-    #   2nd pass: if both are still None, scan the raw blob for pairs of known UIDs
     for cat in cats:
-        pa = uid_map.get(cat._parent_uid_a) if cat._parent_uid_a else None
-        pb = uid_map.get(cat._parent_uid_b) if cat._parent_uid_b else None
+        # ── Primary: pedigree db_key lookup (most reliable) ──────────────
+        pa: Optional[Cat] = None
+        pb: Optional[Cat] = None
+        if cat.db_key in ped_map:
+            pa_k, pb_k = ped_map[cat.db_key]
+            pa = key_to_cat.get(pa_k)
+            pb = key_to_cat.get(pb_k)
 
-        if pa is None and pb is None and uid_set and hasattr(cat, '_raw'):
-            sa, sb = _scan_blob_for_parent_uids(cat._raw, uid_set, cat._uid_int)
-            pa = uid_map.get(sa) if sa else None
-            pb = uid_map.get(sb) if sb else None
+        # ── Fallback: blob UID scan (for founder/pre-pedigree cats) ──────
+        if pa is None and pb is None:
+            pa_u = uid_map.get(cat._parent_uid_a) if cat._parent_uid_a else None
+            pb_u = uid_map.get(cat._parent_uid_b) if cat._parent_uid_b else None
+            if pa_u is None and pb_u is None and uid_set and hasattr(cat, '_raw'):
+                sa, sb = _scan_blob_for_parent_uids(cat._raw, uid_set, cat._uid_int)
+                pa_u = uid_map.get(sa) if sa else None
+                pb_u = uid_map.get(sb) if sb else None
+            pa, pb = pa_u, pb_u
 
         cat.parent_a = pa
         cat.parent_b = pb
+
+    # Assign children lists from pedigree
+    for cat in cats:
+        cat.children = [key_to_cat[k] for k in children_map.get(cat.db_key, [])
+                        if k in key_to_cat]
 
     return cats, errors
 
@@ -1147,88 +1199,107 @@ class CatDetailPanel(QWidget):
 # ── Lineage tree dialog ───────────────────────────────────────────────────────
 
 class LineageDialog(QDialog):
-    """Modal dialog showing up to 3 generations of ancestry for a single cat."""
+    """
+    Family tree dialog — generations from oldest (top) to newest (bottom).
+    Layout:  Grandparents → Parents → Self → Children → Grandchildren
+    """
 
     def __init__(self, cat: 'Cat', parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Family Tree — {cat.name}")
-        self.setMinimumSize(640, 320)
+        self.setMinimumSize(700, 400)
         self.setStyleSheet(
             "QDialog { background:#0a0a18; }"
+            "QScrollArea { border:none; background:#0a0a18; }"
             "QPushButton { background:#1e1e38; color:#ccc; border:1px solid #2a2a4a;"
             " padding:5px 14px; border-radius:4px; font-size:11px; }"
             "QPushButton:hover { background:#252555; }"
         )
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 16)
-        layout.setSpacing(16)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 14)
+        outer.setSpacing(12)
 
-        # Generation labels on the left
-        gen_col = QVBoxLayout()
-        gen_col.setSpacing(0)
-
-        def gen_label(text):
-            l = QLabel(text)
-            l.setStyleSheet("color:#333; font-size:9px; font-weight:bold; letter-spacing:1px;")
-            l.setFixedHeight(60)
-            l.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
-            return l
-
-        def cat_box(cat_obj, highlight=False):
+        # ── Reusable box builder ─────────────────────────────────────────
+        def cat_box(cat_obj, highlight=False, dim=False):
             if cat_obj is None:
                 lbl = QLabel("Unknown")
                 lbl.setStyleSheet(
-                    "color:#2a2a3a; font-size:10px; padding:8px 10px;"
-                    " background:#0d0d1c; border:1px solid #16162a; border-radius:5px;")
+                    "color:#252535; font-size:10px; padding:6px 10px;"
+                    " background:#0d0d1c; border:1px solid #141424; border-radius:5px;")
             else:
-                parts = [f"<b>{cat_obj.name}</b>", cat_obj.gender_display]
+                line1 = cat_obj.name
+                line2 = cat_obj.gender_display
                 if cat_obj.room_display:
-                    parts.append(cat_obj.room_display)
-                text = "  ·  ".join(parts)
-                bg     = "#1a2840" if highlight else "#121222"
-                border = "#3060a0" if highlight else "#222238"
-                lbl = QLabel(text)
+                    line2 += f"  {cat_obj.room_display}"
+                bg     = "#1a2840" if highlight else ("#0e0e1a" if dim else "#121222")
+                border = "#3060a0" if highlight else ("#1a1a28" if dim else "#222238")
+                col    = "#ddd"    if not dim    else "#333"
+                lbl = QLabel(f"<b>{line1}</b><br><span style='color:#888;'>{line2}</span>")
                 lbl.setStyleSheet(
-                    f"color:#ddd; font-size:10px; padding:8px 10px;"
+                    f"color:{col}; font-size:10px; padding:6px 10px;"
                     f" background:{bg}; border:1px solid {border}; border-radius:5px;")
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setWordWrap(True)
-            lbl.setFixedHeight(54)
-            lbl.setMinimumWidth(120)
+            lbl.setMinimumWidth(100)
+            lbl.setMaximumWidth(200)
             return lbl
 
-        # 4-column grid; each generation halves the column span
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(16)
+        # ── Generation label ─────────────────────────────────────────────
+        def gen_row_label(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "color:#333; font-size:9px; font-weight:bold; letter-spacing:1px;"
+                " min-width:90px;")
+            lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            return lbl
 
-        # Row 0 — focus cat (center, spans cols 1-2 of 4)
-        grid.addWidget(cat_box(cat, highlight=True), 0, 1, 1, 2)
+        def make_gen_row(label_text, cat_list, highlight_all=False, dim_all=False):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(gen_row_label(label_text))
+            for c in cat_list:
+                row.addWidget(cat_box(c, highlight=highlight_all,
+                                      dim=(dim_all and c is not None)))
+            row.addStretch()
+            outer.addLayout(row)
 
-        # Row 1 — parents
+        # ── Build generations ────────────────────────────────────────────
         pa, pb = cat.parent_a, cat.parent_b
-        grid.addWidget(cat_box(pa), 1, 0, 1, 2)
-        grid.addWidget(cat_box(pb), 1, 2, 1, 2)
+        gp_a1 = pa.parent_a if pa else None
+        gp_a2 = pa.parent_b if pa else None
+        gp_b1 = pb.parent_a if pb else None
+        gp_b2 = pb.parent_b if pb else None
 
-        # Row 2 — grandparents (one per column)
-        for parent, start in ((pa, 0), (pb, 2)):
-            gp_a = parent.parent_a if parent else None
-            gp_b = parent.parent_b if parent else None
-            grid.addWidget(cat_box(gp_a), 2, start)
-            grid.addWidget(cat_box(gp_b), 2, start + 1)
+        grandparents = [gp_a1, gp_a2, gp_b1, gp_b2]
+        parents      = [pa, pb]
 
-        layout.addLayout(grid)
+        children = list(cat.children)
+        grandchildren: list = []
+        for child in children:
+            grandchildren.extend(child.children)
 
-        # Gen labels overlay (simple side column alternative)
-        for row, label in enumerate(["You", "Parents", "Grandparents"]):
-            lbl = QLabel(label)
-            lbl.setStyleSheet("color:#2a2a3a; font-size:9px; letter-spacing:1px;")
-            grid.addWidget(lbl, row, 4)
+        make_gen_row("GRANDPARENTS", grandparents)
+        make_gen_row("PARENTS",      parents)
+        make_gen_row("",             [cat], highlight_all=True)
+        if children:
+            make_gen_row("CHILDREN", children[:8])
+            if len(children) > 8:
+                outer.addWidget(
+                    QLabel(f"  … and {len(children)-8} more children",
+                           styleSheet="color:#444; font-size:10px; padding-left:100px;"))
+        if grandchildren:
+            unique_gc = list({id(g): g for g in grandchildren}.values())
+            make_gen_row("GRANDCHILDREN", unique_gc[:8])
+            if len(unique_gc) > 8:
+                outer.addWidget(
+                    QLabel(f"  … and {len(unique_gc)-8} more grandchildren",
+                           styleSheet="color:#444; font-size:10px; padding-left:100px;"))
 
+        outer.addStretch()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+        outer.addWidget(close_btn, alignment=Qt.AlignRight)
 
 
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
