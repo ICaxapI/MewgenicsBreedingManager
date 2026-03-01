@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
-    QFileSystemWatcher,
+    QFileSystemWatcher, QItemSelectionModel,
 )
 from PySide6.QtGui import QColor, QBrush, QAction, QPalette
 
@@ -393,15 +393,17 @@ class Cat:
         if vis:
             self.mutations = vis + self.mutations
 
-        # Gender override: read sex u16 at _name_end+8 (from blob format research).
-        # Mapping: 0 = ditto/unknown, 1 = male, 2 = female.
-        # This supersedes the unreliable deep-blob string read, which mis-classifies
-        # ditto cats as "female" when the blob happens to contain that string later.
-        try:
-            sex_u16 = struct.unpack_from('<H', raw, _name_end + 8)[0]
-            self.gender = {1: "male", 2: "female"}.get(sex_u16, "?")
-        except Exception:
-            pass  # keep string-based fallback
+        # For cats whose deep-blob gender string resolved cleanly to "male"/"female",
+        # trust that result — it is authoritative and overriding it has been shown
+        # to mis-gender some cats (e.g. Midna).  Only attempt the sex_u16 fallback
+        # at _name_end+8 when the deep-blob read returned something ambiguous (e.g.
+        # ditto cats, where the parser position drifts and returns the wrong string).
+        if self.gender not in ("male", "female"):
+            try:
+                sex_u16 = struct.unpack_from('<H', raw, _name_end + 8)[0]
+                self.gender = {1: "male", 2: "female"}.get(sex_u16, "?")
+            except Exception:
+                pass
 
     # ── Display helpers ────────────────────────────────────────────────────
 
@@ -914,12 +916,28 @@ class CatDetailPanel(QWidget):
             dl.setStyleSheet("color:#5a9; font-size:11px;")
             id_col.addWidget(dl)
 
+        def _navigate(target: Cat):
+            mw = self.window()
+            # Reset filter so the target is definitely visible in the table
+            mw._filter(None, mw._btn_all)
+            for row in range(mw._source_model.rowCount()):
+                if mw._source_model.cat_at(row) is target:
+                    proxy_idx = mw._proxy_model.mapFromSource(
+                        mw._source_model.index(row, 0))
+                    if proxy_idx.isValid():
+                        mw._table.selectionModel().setCurrentIndex(
+                            proxy_idx,
+                            QItemSelectionModel.SelectionFlag.ClearAndSelect |
+                            QItemSelectionModel.SelectionFlag.Rows)
+                        mw._table.scrollTo(proxy_idx)
+                    break
+
         tree_btn = QPushButton("Family Tree…")
         tree_btn.setStyleSheet(
             "QPushButton { color:#5a8aaa; background:transparent; border:1px solid #252545;"
             " padding:3px 8px; border-radius:4px; font-size:10px; }"
             "QPushButton:hover { background:#131328; }")
-        tree_btn.clicked.connect(lambda: LineageDialog(cat, self).exec())
+        tree_btn.clicked.connect(lambda: LineageDialog(cat, self, navigate_fn=_navigate).exec())
         id_col.addWidget(tree_btn)
         id_col.addStretch()
         root.addLayout(id_col)
@@ -1204,7 +1222,7 @@ class LineageDialog(QDialog):
     Layout:  Grandparents → Parents → Self → Children → Grandchildren
     """
 
-    def __init__(self, cat: 'Cat', parent=None):
+    def __init__(self, cat: 'Cat', parent=None, navigate_fn=None):
         super().__init__(parent)
         self.setWindowTitle(f"Family Tree — {cat.name}")
         self.setMinimumSize(700, 400)
@@ -1223,27 +1241,33 @@ class LineageDialog(QDialog):
         # ── Reusable box builder ─────────────────────────────────────────
         def cat_box(cat_obj, highlight=False, dim=False):
             if cat_obj is None:
-                lbl = QLabel("Unknown")
-                lbl.setStyleSheet(
-                    "color:#252535; font-size:10px; padding:6px 10px;"
-                    " background:#0d0d1c; border:1px solid #141424; border-radius:5px;")
+                btn = QPushButton("Unknown")
+                btn.setEnabled(False)
+                btn.setStyleSheet(
+                    "QPushButton { color:#252535; font-size:10px; padding:6px 10px;"
+                    " background:#0d0d1c; border:1px solid #141424; border-radius:5px; }")
             else:
-                line1 = cat_obj.name
                 line2 = cat_obj.gender_display
                 if cat_obj.room_display:
                     line2 += f"  {cat_obj.room_display}"
                 bg     = "#1a2840" if highlight else ("#0e0e1a" if dim else "#121222")
                 border = "#3060a0" if highlight else ("#1a1a28" if dim else "#222238")
                 col    = "#ddd"    if not dim    else "#333"
-                lbl = QLabel(f"<b>{line1}</b><br><span style='color:#888;'>{line2}</span>")
-                lbl.setStyleSheet(
-                    f"color:{col}; font-size:10px; padding:6px 10px;"
-                    f" background:{bg}; border:1px solid {border}; border-radius:5px;")
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setWordWrap(True)
-            lbl.setMinimumWidth(100)
-            lbl.setMaximumWidth(200)
-            return lbl
+                can_nav = navigate_fn is not None and cat_obj is not cat
+                hover  = "#1d3560" if can_nav else bg
+                btn = QPushButton(f"{cat_obj.name}\n{line2}")
+                btn.setStyleSheet(
+                    f"QPushButton {{ color:{col}; font-size:10px; padding:6px 10px;"
+                    f" background:{bg}; border:1px solid {border}; border-radius:5px;"
+                    f" text-align:center; }}"
+                    f"QPushButton:hover {{ background:{hover}; }}")
+                if can_nav:
+                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    btn.clicked.connect(
+                        lambda checked=False, c=cat_obj: (self.accept(), navigate_fn(c)))
+            btn.setMinimumWidth(100)
+            btn.setMaximumWidth(200)
+            return btn
 
         # ── Generation label ─────────────────────────────────────────────
         def gen_row_label(text):
