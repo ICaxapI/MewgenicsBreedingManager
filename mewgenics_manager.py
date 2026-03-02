@@ -42,6 +42,22 @@ def _valid_str(s) -> bool:
     """Reject None, empty, and game filler strings like 'none' or 'defaultmove'."""
     return bool(s) and s.strip().lower() not in _JUNK_STRINGS
 
+def _normalize_gender(raw_gender: Optional[str]) -> str:
+    """
+    Normalize save-data gender variants to app-level values:
+      - maleX   -> "male"
+      - femaleX -> "female"
+      - spidercat (ditto-like) -> "?"
+    """
+    g = (raw_gender or "").strip().lower()
+    if g.startswith("male"):
+        return "male"
+    if g.startswith("female"):
+        return "female"
+    if g == "spidercat":
+        return "?"
+    return "?"
+
 def _with_min_font_px(stylesheet: str, min_px: int = _ACCESSIBILITY_MIN_FONT_PX) -> str:
     """Clamp stylesheet font-size declarations to an accessible minimum."""
     if not stylesheet or "font-size" not in stylesheet:
@@ -564,7 +580,14 @@ class Cat:
         self.visual_mutation_ids = [T[i] for i in range(14, 29) if i < 72 and T[i] != 0]
 
         r.skip(12)
-        self.gender = r.str() or "?"
+        raw_gender = r.str()
+        # Authoritative sex enum near the name block:
+        #   0 = male, 1 = female, 2 = undefined/both (ditto-like)
+        sex_code = raw[_name_end + 8] if (_name_end + 9) <= len(raw) else None
+        self.gender = {0: "male", 1: "female", 2: "?"}.get(
+            sex_code,
+            _normalize_gender(raw_gender),
+        )
         r.f64()
 
         self.stat_base = [r.u32() for _ in range(7)]
@@ -688,17 +711,7 @@ class Cat:
         if vis:
             self.mutations = vis + self.mutations
 
-        # For cats whose deep-blob gender string resolved cleanly to "male"/"female",
-        # trust that result — it is authoritative and overriding it has been shown
-        # to mis-gender some cats (e.g. Midna).  Only attempt the sex_u16 fallback
-        # at _name_end+8 when the deep-blob read returned something ambiguous (e.g.
-        # ditto cats, where the parser position drifts and returns the wrong string).
-        if self.gender not in ("male", "female"):
-            try:
-                sex_u16 = struct.unpack_from('<H', raw, _name_end + 8)[0]
-                self.gender = {1: "male", 2: "female"}.get(sex_u16, "female")
-            except Exception:
-                pass
+        # Legacy token fallback is already handled above when sex_code is unavailable.
 
     # ── Display helpers ────────────────────────────────────────────────────
 
@@ -713,7 +726,7 @@ class Cat:
         g = (self.gender or "").strip().lower()
         if g.startswith("male"):   return "M"
         if g.startswith("female"): return "F"
-        return "F"  # unknown/ditto defaults to F
+        return "?"
 
     @property
     def can_move(self) -> bool:
@@ -863,14 +876,19 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
     """Return (ok, reason). reason is non-empty only when ok is False."""
     if a is b:
         return False, "Cannot pair a cat with itself"
-    ga, gb = a.gender_display, b.gender_display
-    if ga == "M" and gb == "F":
+    ga = (a.gender or "?").strip().lower()
+    gb = (b.gender or "?").strip().lower()
+    # Spidercat/unknown cats ('?') are allowed to pair with any gender.
+    if ga == "?" or gb == "?":
         return True, ""
-    if ga == "F" and gb == "M":
+    if ga != gb and {ga, gb} == {"male", "female"}:
         return True, ""
-    # Same sex
-    label = "female" if ga == "F" else "male"
-    return False, f"Both cats are {label} — cannot produce offspring"
+    # Same known sex
+    if ga == "female" and gb == "female":
+        return False, "Both cats are female — cannot produce offspring"
+    if ga == "male" and gb == "male":
+        return False, "Both cats are male — cannot produce offspring"
+    return False, "Cats have incompatible genders — cannot produce offspring"
 
 
 # ── Compatibility check ───────────────────────────────────────────────────────
