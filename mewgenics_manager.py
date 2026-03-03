@@ -22,21 +22,62 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QPushButton, QLabel, QFileDialog, QHeaderView,
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
-    QLineEdit,
+    QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QToolButton,
+    QTableWidget, QTableWidgetItem, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
-    QFileSystemWatcher, QItemSelectionModel,
+    QFileSystemWatcher, QItemSelectionModel, QSize,
 )
-from PySide6.QtGui import QColor, QBrush, QAction, QPalette
+from PySide6.QtGui import QColor, QBrush, QAction, QPalette, QFont, QKeySequence, QFontMetrics
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _JUNK_STRINGS = frozenset({"none", "null", "", "defaultmove", "default_move"})
+_ACCESSIBILITY_MIN_FONT_PX = 12
+_ACCESSIBILITY_MIN_FONT_PT = 10.0
+_FONT_SIZE_RE = re.compile(r"(font-size\s*:\s*)(\d+)(px)")
 
 def _valid_str(s) -> bool:
     """Reject None, empty, and game filler strings like 'none' or 'defaultmove'."""
     return bool(s) and s.strip().lower() not in _JUNK_STRINGS
+
+def _normalize_gender(raw_gender: Optional[str]) -> str:
+    """
+    Normalize save-data gender variants to app-level values:
+      - maleX   -> "male"
+      - femaleX -> "female"
+      - spidercat (ditto-like) -> "?"
+    """
+    g = (raw_gender or "").strip().lower()
+    if g.startswith("male"):
+        return "male"
+    if g.startswith("female"):
+        return "female"
+    if g == "spidercat":
+        return "?"
+    return "?"
+
+def _with_min_font_px(stylesheet: str, min_px: int = _ACCESSIBILITY_MIN_FONT_PX) -> str:
+    """Clamp stylesheet font-size declarations to an accessible minimum."""
+    if not stylesheet or "font-size" not in stylesheet:
+        return stylesheet
+    return _FONT_SIZE_RE.sub(
+        lambda m: f"{m.group(1)}{max(min_px, int(m.group(2)))}{m.group(3)}",
+        stylesheet,
+    )
+
+def _enforce_min_font_in_widget_tree(root: Optional[QWidget], min_px: int = _ACCESSIBILITY_MIN_FONT_PX):
+    """Apply minimum stylesheet font size to a widget and all descendants."""
+    if root is None:
+        return
+    widgets = [root] + root.findChildren(QWidget)
+    for widget in widgets:
+        style = widget.styleSheet()
+        if style and "font-size" in style:
+            adjusted = _with_min_font_px(style, min_px=min_px)
+            if adjusted != style:
+                widget.setStyleSheet(adjusted)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -539,7 +580,14 @@ class Cat:
         self.visual_mutation_ids = [T[i] for i in range(14, 29) if i < 72 and T[i] != 0]
 
         r.skip(12)
-        self.gender = r.str() or "?"
+        raw_gender = r.str()
+        # Authoritative sex enum near the name block:
+        #   0 = male, 1 = female, 2 = undefined/both (ditto-like)
+        sex_code = raw[_name_end + 8] if (_name_end + 9) <= len(raw) else None
+        self.gender = {0: "male", 1: "female", 2: "?"}.get(
+            sex_code,
+            _normalize_gender(raw_gender),
+        )
         r.f64()
 
         self.stat_base = [r.u32() for _ in range(7)]
@@ -663,17 +711,7 @@ class Cat:
         if vis:
             self.mutations = vis + self.mutations
 
-        # For cats whose deep-blob gender string resolved cleanly to "male"/"female",
-        # trust that result — it is authoritative and overriding it has been shown
-        # to mis-gender some cats (e.g. Midna).  Only attempt the sex_u16 fallback
-        # at _name_end+8 when the deep-blob read returned something ambiguous (e.g.
-        # ditto cats, where the parser position drifts and returns the wrong string).
-        if self.gender not in ("male", "female"):
-            try:
-                sex_u16 = struct.unpack_from('<H', raw, _name_end + 8)[0]
-                self.gender = {1: "male", 2: "female"}.get(sex_u16, "female")
-            except Exception:
-                pass
+        # Legacy token fallback is already handled above when sex_code is unavailable.
 
     # ── Display helpers ────────────────────────────────────────────────────
 
@@ -688,7 +726,7 @@ class Cat:
         g = (self.gender or "").strip().lower()
         if g.startswith("male"):   return "M"
         if g.startswith("female"): return "F"
-        return "F"  # unknown/ditto defaults to F
+        return "?"
 
     @property
     def can_move(self) -> bool:
@@ -717,9 +755,110 @@ def get_all_ancestors(cat: Optional[Cat], depth: int = 6, _seen: set = None) -> 
     return ancestors
 
 
+def _ancestor_depths(cat: Optional[Cat], max_depth: int = 8) -> dict[Cat, int]:
+    """
+    Return a map of ancestor -> generational distance.
+    Includes `cat` itself at depth 0, then parents at depth 1, etc.
+    """
+    if cat is None:
+        return {}
+    depths: dict[Cat, int] = {cat: 0}
+    frontier: list[tuple[Cat, int]] = [(cat, 0)]
+    while frontier:
+        cur, d = frontier.pop(0)
+        if d >= max_depth:
+            continue
+        for parent in (cur.parent_a, cur.parent_b):
+            if parent is None:
+                continue
+            nd = d + 1
+            prev = depths.get(parent)
+            if prev is None or nd < prev:
+                depths[parent] = nd
+                frontier.append((parent, nd))
+    return depths
+
+
+def _ancestor_paths(start: Optional['Cat'], max_steps: int = 12) -> dict['Cat', list[tuple['Cat', ...]]]:
+    """
+    For each reachable ancestor, return all unique upward paths from `start`
+    to that ancestor (inclusive). Paths never repeat the same cat.
+    """
+    if start is None:
+        return {}
+    paths: dict[Cat, list[tuple[Cat, ...]]] = {}
+    stack: list[tuple[Cat, tuple[Cat, ...], frozenset[int]]] = [(start, (start,), frozenset({id(start)}))]
+    while stack:
+        node, path, seen = stack.pop()
+        paths.setdefault(node, []).append(path)
+        steps = len(path) - 1
+        if steps >= max_steps:
+            continue
+        for parent in (node.parent_a, node.parent_b):
+            if parent is None:
+                continue
+            pid = id(parent)
+            if pid in seen:
+                continue
+            stack.append((parent, path + (parent,), seen | frozenset({pid})))
+    return paths
+
+
+def raw_coi(a: Optional['Cat'], b: Optional['Cat'], max_steps: int = 12) -> float:
+    """
+    Raw Coefficient of Inbreeding between two cats:
+      sum(0.5 ** (n + 1)) over all valid paths through common ancestors,
+    where n = total edge count from A up to ancestor and down to B.
+    """
+    if a is None or b is None:
+        return 0.0
+    pa = _ancestor_paths(a, max_steps=max_steps)
+    pb = _ancestor_paths(b, max_steps=max_steps)
+    common = set(pa.keys()) & set(pb.keys())
+    if not common:
+        return 0.0
+    coi = 0.0
+    for anc in common:
+        for path_a in pa[anc]:
+            set_a = {id(x) for x in path_a}
+            sa = len(path_a) - 1
+            for path_b in pb[anc]:
+                # Valid full path cannot pass through the same cat twice
+                # (except the common ancestor itself).
+                overlap = (set_a & {id(x) for x in path_b}) - {id(anc)}
+                if overlap:
+                    continue
+                sb = len(path_b) - 1
+                coi += 0.5 ** (sa + sb + 1)
+    return coi
+
+
+def risk_percent(a: Optional['Cat'], b: Optional['Cat']) -> float:
+    """
+    Normalize raw CoI to UI risk scale:
+      0.25 CoI => 100% risk, clamped to [0, 100].
+    """
+    return max(0.0, min(100.0, (raw_coi(a, b) / 0.25) * 100.0))
+
+
 def find_common_ancestors(a: Cat, b: Cat) -> list[Cat]:
     """Return cats that appear in both ancestry trees."""
     return list(get_all_ancestors(a) & get_all_ancestors(b))
+
+
+def shared_ancestor_counts(a: Cat, b: Cat, recent_depth: int = 3, max_depth: int = 8) -> tuple[int, int]:
+    """
+    Return (total_shared, recent_shared) common ancestor counts.
+    recent_shared counts ancestors where both cats are within `recent_depth`
+    generations of that ancestor (used for inbreeding-risk checks).
+    """
+    da = _ancestor_depths(a, max_depth=max_depth)
+    db = _ancestor_depths(b, max_depth=max_depth)
+    common = set(da.keys()) & set(db.keys())
+    if not common:
+        return 0, 0
+    recent_shared = sum(1 for anc in common if da[anc] <= recent_depth and db[anc] <= recent_depth)
+    return len(common), recent_shared
 
 
 def get_parents(cat: Cat) -> list[Cat]:
@@ -737,14 +876,19 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
     """Return (ok, reason). reason is non-empty only when ok is False."""
     if a is b:
         return False, "Cannot pair a cat with itself"
-    ga, gb = a.gender_display, b.gender_display
-    if ga == "M" and gb == "F":
+    ga = (a.gender or "?").strip().lower()
+    gb = (b.gender or "?").strip().lower()
+    # Spidercat/unknown cats ('?') are allowed to pair with any gender.
+    if ga == "?" or gb == "?":
         return True, ""
-    if ga == "F" and gb == "M":
+    if ga != gb and {ga, gb} == {"male", "female"}:
         return True, ""
-    # Same sex
-    label = "female" if ga == "F" else "male"
-    return False, f"Both cats are {label} — cannot produce offspring"
+    # Same known sex
+    if ga == "female" and gb == "female":
+        return False, "Both cats are female — cannot produce offspring"
+    if ga == "male" and gb == "male":
+        return False, "Both cats are male — cannot produce offspring"
+    return False, "Cats have incompatible genders — cannot produce offspring"
 
 
 # ── Compatibility check ───────────────────────────────────────────────────────
@@ -938,7 +1082,7 @@ def find_save_files() -> list[str]:
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Gen", "Source", "Inbr"]
+COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Risk%", "Gen", "Source", "Inbr"]
 COL_NAME  = 0
 COL_GEN   = 1
 COL_ROOM  = 2
@@ -947,14 +1091,19 @@ STAT_COLS = list(range(4, 11))   # STR … LCK  (indices 4–10)
 COL_SUM   = 11
 COL_ABIL  = 12
 COL_MUTS  = 13
-COL_AGE   = 14   # generation depth
-COL_SRC   = 15
-COL_INB   = 16
+COL_REL   = 14
+COL_AGE   = 15   # generation depth
+COL_SRC   = 16
+COL_INB   = 17
 
 # Fixed pixel widths for narrow columns
 _W_STATUS = 62
 _W_STAT   = 34
 _W_GEN    = 28
+_W_REL    = 68
+_ZOOM_MIN = 70
+_ZOOM_MAX = 200
+_ZOOM_STEP = 10
 
 
 class CatTableModel(QAbstractTableModel):
@@ -963,6 +1112,7 @@ class CatTableModel(QAbstractTableModel):
         self._cats: list[Cat] = []
         self._focus_cat: Optional[Cat] = None
         self._show_lineage: bool = False
+        self._relation_cache: dict[int, float] = {}
 
     def set_show_lineage(self, show: bool):
         self._show_lineage = show
@@ -976,16 +1126,31 @@ class CatTableModel(QAbstractTableModel):
     def load(self, cats: list[Cat]):
         self.beginResetModel()
         self._cats = cats
+        self._relation_cache.clear()
         self.endResetModel()
 
     def set_focus_cat(self, cat: Optional[Cat]):
         self._focus_cat = cat
+        self._relation_cache.clear()
         if self._cats:
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._cats) - 1, len(COLUMNS) - 1),
-                [Qt.BackgroundRole, Qt.ForegroundRole],
+                [Qt.DisplayRole, Qt.UserRole, Qt.BackgroundRole, Qt.ForegroundRole],
             )
+
+    def _relation_for(self, cat: Cat) -> float:
+        if self._focus_cat is None:
+            return 0.0
+        if cat is self._focus_cat:
+            return 100.0
+        key = id(cat)
+        cached = self._relation_cache.get(key)
+        if cached is not None:
+            return cached
+        pct = risk_percent(self._focus_cat, cat)
+        self._relation_cache[key] = pct
+        return pct
 
     def rowCount(self, parent=QModelIndex()):    return len(self._cats)
     def columnCount(self, parent=QModelIndex()): return len(COLUMNS)
@@ -1014,6 +1179,10 @@ class CatTableModel(QAbstractTableModel):
                 return ", ".join(cat.mutations)
             if col == COL_ABIL:
                 return ", ".join(cat.abilities)
+            if col == COL_REL:
+                if self._focus_cat is None:
+                    return "—"
+                return f"{int(round(self._relation_for(cat)))}%"
             if col == COL_AGE:
                 return str(cat.generation)
             if col == COL_SRC:
@@ -1034,6 +1203,8 @@ class CatTableModel(QAbstractTableModel):
                 return cat.base_stats[STAT_NAMES[col - 4]]
             if col == COL_SUM:
                 return sum(cat.base_stats.values())
+            if col == COL_REL:
+                return self._relation_for(cat) if self._focus_cat is not None else -1.0
             if col == COL_AGE:
                 return cat.generation
             return self.data(index, Qt.DisplayRole)
@@ -1104,7 +1275,7 @@ class CatTableModel(QAbstractTableModel):
                 return "\n".join(cat.abilities)
 
         elif role == Qt.TextAlignmentRole:
-            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_SUM, COL_AGE):
+            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_SUM, COL_REL, COL_AGE):
                 return Qt.AlignCenter
 
         return None
@@ -1229,6 +1400,7 @@ class CatDetailPanel(QWidget):
             self._build_single(cats[0])
         else:
             self._build_pair(cats[0], cats[1])
+        _enforce_min_font_in_widget_tree(self)
 
     # ── Single cat ─────────────────────────────────────────────────────────
 
@@ -1680,6 +1852,536 @@ class LineageDialog(QDialog):
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         outer.addWidget(close_btn, alignment=Qt.AlignRight)
+        _enforce_min_font_in_widget_tree(self)
+
+
+class FamilyTreeBrowserView(QWidget):
+    """
+    Dedicated tree-browsing view:
+    left side = cat list, right side = visual family tree for selected cat.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QListWidget { background:#0d0d1c; color:#ddd; border:1px solid #1e1e38; }"
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+            "QScrollArea { border:none; background:#0a0a18; }"
+        )
+        self._cats: list[Cat] = []
+        self._by_key: dict[int, Cat] = {}
+        self._alive_only: bool = True
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        # Left pane: search + list
+        left = QWidget()
+        left.setFixedWidth(320)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        lv.addWidget(QLabel("Cats", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(6)
+        self._all_btn = _sidebar_btn("All")
+        self._alive_btn = _sidebar_btn("Alive")
+        self._all_btn.setCheckable(True)
+        self._alive_btn.setCheckable(True)
+        self._alive_btn.setChecked(True)
+        self._all_btn.clicked.connect(lambda: self._set_alive_only(False))
+        self._alive_btn.clicked.connect(lambda: self._set_alive_only(True))
+        mode_row.addWidget(self._all_btn)
+        mode_row.addWidget(self._alive_btn)
+        lv.addLayout(mode_row)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search cat name…")
+        lv.addWidget(self._search)
+        self._list = QListWidget()
+        lv.addWidget(self._list, 1)
+        root.addWidget(left)
+
+        # Right pane: tree
+        self._tree_scroll = QScrollArea()
+        self._tree_scroll.setWidgetResizable(True)
+        self._tree_content = QWidget()
+        self._tree_scroll.setWidget(self._tree_content)
+        root.addWidget(self._tree_scroll, 1)
+
+        self._search.textChanged.connect(self._refresh_list)
+        self._list.currentItemChanged.connect(self._on_current_item_changed)
+        _enforce_min_font_in_widget_tree(self)
+
+    def set_cats(self, cats: list[Cat]):
+        selected_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            selected_key = int(cur.data(Qt.UserRole))
+        self._cats = sorted(cats, key=lambda c: (c.name or "").lower())
+        self._by_key = {c.db_key: c for c in self._cats}
+        self._refresh_list()
+        if selected_key is not None and selected_key in self._by_key:
+            self.select_cat(self._by_key[selected_key])
+        elif self._list.count():
+            self._list.setCurrentRow(0)
+        else:
+            self._render_tree(None)
+
+    def select_cat(self, cat: Optional[Cat]):
+        if cat is None:
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if int(item.data(Qt.UserRole)) == cat.db_key:
+                self._list.setCurrentRow(i)
+                self._list.scrollToItem(item)
+                return
+
+    def _open_cat_from_tree(self, cat: Optional[Cat]):
+        if cat is None:
+            return
+        # If a gone cat is clicked while Alive filter is active, switch to All.
+        if self._alive_only and cat.status == "Gone":
+            self._set_alive_only(False)
+        # Ensure search does not hide the clicked target.
+        if self._search.text():
+            self._search.clear()
+        self.select_cat(cat)
+
+    def _set_alive_only(self, enabled: bool):
+        self._alive_only = enabled
+        self._alive_btn.setChecked(enabled)
+        self._all_btn.setChecked(not enabled)
+        self._refresh_list()
+
+    def _refresh_list(self):
+        query = self._search.text().strip().lower()
+        current_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            current_key = int(cur.data(Qt.UserRole))
+
+        self._list.clear()
+        for cat in self._cats:
+            if self._alive_only and cat.status == "Gone":
+                continue
+            if query and query not in cat.name.lower():
+                continue
+            label = f"{cat.name}  ({cat.gender_display})"
+            if cat.status != "In House":
+                label += f"  [{STATUS_ABBREV.get(cat.status, cat.status)}]"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, cat.db_key)
+            self._list.addItem(item)
+
+        if self._list.count() == 0:
+            self._render_tree(None)
+            return
+        if current_key is not None:
+            for i in range(self._list.count()):
+                it = self._list.item(i)
+                if int(it.data(Qt.UserRole)) == current_key:
+                    self._list.setCurrentRow(i)
+                    return
+        self._list.setCurrentRow(0)
+
+    def _on_current_item_changed(self, current, previous):
+        if current is None:
+            self._render_tree(None)
+            return
+        cat = self._by_key.get(int(current.data(Qt.UserRole)))
+        self._render_tree(cat)
+
+    def _render_tree(self, cat: Optional[Cat]):
+        self._tree_content = QWidget()
+        self._tree_scroll.setWidget(self._tree_content)
+
+        root = QVBoxLayout(self._tree_content)
+        root.setContentsMargins(8, 6, 8, 8)
+        root.setSpacing(10)
+
+        if cat is None:
+            root.addWidget(QLabel("No cats match the current filter.", styleSheet="color:#666; font-size:12px;"))
+            root.addStretch()
+            return
+
+        title = QLabel(f"Family Tree — {cat.name}")
+        title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
+        root.addWidget(title)
+        root.addWidget(QLabel("Click any box to jump to that cat.", styleSheet="color:#666; font-size:11px;"))
+
+        def cat_box(c: Optional[Cat], highlight=False):
+            if c is None:
+                btn = QPushButton("Unknown")
+                btn.setEnabled(False)
+                btn.setStyleSheet(
+                    "QPushButton { color:#303040; font-size:10px; padding:7px 10px;"
+                    " background:#0e0e1c; border:1px solid #18182a; border-radius:6px; }")
+                return btn
+            line2 = c.gender_display
+            if c.room_display:
+                line2 += f"  {c.room_display}"
+            if c.status == "Gone":
+                line2 += "  (Gone)"
+            bg = "#1d2f4a" if highlight else "#131326"
+            border = "#3b5f95" if highlight else "#252545"
+            btn = QPushButton(f"{c.name}\n{line2}")
+            btn.setStyleSheet(
+                f"QPushButton {{ color:#ddd; font-size:10px; padding:7px 10px;"
+                f" background:{bg}; border:1px solid {border}; border-radius:6px; }}"
+                "QPushButton:hover { background:#1a2a46; }")
+            if c is not cat:
+                btn.clicked.connect(lambda checked=False, target=c: self._open_cat_from_tree(target))
+            else:
+                btn.setEnabled(False)
+            btn.setMinimumWidth(120)
+            return btn
+
+        def row_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color:#444; font-weight:bold; letter-spacing:1px;")
+            lbl.setFixedWidth(row_label_width)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            return lbl
+
+        def add_generation_row(label: str, cats_row: list[Optional[Cat]], highlight_self=False):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(row_label(label))
+            for c in cats_row:
+                row.addWidget(cat_box(c, highlight=highlight_self and c is cat))
+            row.addStretch()
+            root.addLayout(row)
+
+        def add_arrow():
+            a = QLabel("↓")
+            a.setStyleSheet("color:#2f3f66; font-size:16px;")
+            a.setAlignment(Qt.AlignCenter)
+            root.addWidget(a)
+
+        def _dedupe_keep_order(items: list[Cat]) -> list[Cat]:
+            seen = set()
+            out: list[Cat] = []
+            for item in items:
+                sid = id(item)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                out.append(item)
+            return out
+
+        def _ancestor_row_label(level: int) -> str:
+            if level == 1:
+                return "PARENTS"
+            if level == 2:
+                return "GRANDPARENTS"
+            if level == 3:
+                return "GREAT-GRANDPARENTS"
+            return f"{level - 2}x GREAT-GRANDPARENTS"
+
+        # Build all known ancestor levels (1=parents, 2=grandparents, ...).
+        ancestor_levels: list[list[Cat]] = []
+        frontier: list[Cat] = [cat]
+        for _ in range(8):
+            nxt: list[Cat] = []
+            for node in frontier:
+                if node.parent_a is not None:
+                    nxt.append(node.parent_a)
+                if node.parent_b is not None:
+                    nxt.append(node.parent_b)
+            nxt = _dedupe_keep_order(nxt)
+            if not nxt:
+                break
+            ancestor_levels.append(nxt)
+            frontier = nxt
+
+        # Dynamic row-label gutter width: based on the longest visible label and
+        # current font metrics, so it tracks zoom/font-size changes.
+        label_texts = ["SELF", "CHILDREN", "GRANDCHILDREN"] + [
+            _ancestor_row_label(i) for i in range(1, len(ancestor_levels) + 1)
+        ]
+        label_font = QFont(self.font())
+        label_font.setBold(True)
+        fm = QFontMetrics(label_font)
+        max_text_px = max(fm.horizontalAdvance(t) for t in label_texts)
+        # Row labels use letter-spacing:1px in stylesheet; account for that so
+        # long prefixes like "10x " are fully measured.
+        max_letter_spacing_px = max(max(len(t) - 1, 0) for t in label_texts)
+        row_label_width = max(120, max_text_px + max_letter_spacing_px + 24)
+
+        children = list(cat.children)
+        grandchildren: list[Cat] = []
+        for child in children:
+            grandchildren.extend(child.children)
+        grandchildren = list({id(c): c for c in grandchildren}.values())
+
+        # Render oldest ancestors at top, then down to self.
+        for idx in range(len(ancestor_levels), 0, -1):
+            level_nodes = ancestor_levels[idx - 1]
+            add_generation_row(_ancestor_row_label(idx), level_nodes[:12])
+            if len(level_nodes) > 12:
+                root.addWidget(QLabel(
+                    f"… and {len(level_nodes)-12} more in {_ancestor_row_label(idx)}",
+                    styleSheet="color:#555; font-size:10px;"))
+            add_arrow()
+        add_generation_row("SELF", [cat], highlight_self=True)
+
+        if children:
+            add_arrow()
+            add_generation_row("CHILDREN", children[:10])
+            if len(children) > 10:
+                root.addWidget(QLabel(f"… and {len(children)-10} more children", styleSheet="color:#555; font-size:10px;"))
+        if grandchildren:
+            add_arrow()
+            add_generation_row("GRANDCHILDREN", grandchildren[:10])
+            if len(grandchildren) > 10:
+                root.addWidget(QLabel(f"… and {len(grandchildren)-10} more grandchildren", styleSheet="color:#555; font-size:10px;"))
+        if not any([ancestor_levels, children, grandchildren]):
+            root.addWidget(QLabel("No known lineage data for this cat yet.", styleSheet="color:#666; font-size:12px;"))
+
+        root.addStretch()
+        _enforce_min_font_in_widget_tree(self._tree_content)
+
+
+class SafeBreedingView(QWidget):
+    """Dedicated view for ranking alive breeding candidates."""
+    class _ColumnPaddingDelegate(QStyledItemDelegate):
+        def __init__(self, extra_width: int, left_padding: int = 0, parent=None):
+            super().__init__(parent)
+            self._extra_width = extra_width
+            self._left_padding = left_padding
+
+        def sizeHint(self, option, index):
+            s = super().sizeHint(option, index)
+            return QSize(s.width() + self._extra_width, s.height())
+
+        def paint(self, painter, option, index):
+            if self._left_padding <= 0:
+                return super().paint(painter, option, index)
+
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            style = opt.widget.style() if opt.widget is not None else QApplication.style()
+
+            text = opt.text
+            opt.text = ""
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+
+            text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget).adjusted(
+                self._left_padding, 0, 0, 0
+            )
+            if opt.textElideMode != Qt.ElideNone:
+                text = opt.fontMetrics.elidedText(text, opt.textElideMode, text_rect.width())
+
+            painter.save()
+            if opt.state & QStyle.State_Selected:
+                painter.setPen(opt.palette.color(QPalette.HighlightedText))
+            else:
+                painter.setPen(opt.palette.color(QPalette.Text))
+            painter.setFont(opt.font)
+            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+            painter.restore()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QListWidget { background:#0d0d1c; color:#ddd; border:1px solid #1e1e38; }"
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; }"
+            "QHeaderView::section { background:#151532; color:#7d8bb0; border:none; padding:4px; font-weight:bold; }"
+        )
+        self._cats: list[Cat] = []
+        self._alive: list[Cat] = []
+        self._by_key: dict[int, Cat] = {}
+        self._table_row_cat_keys: list[int] = []
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        left = QWidget()
+        left.setFixedWidth(320)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        lv.addWidget(QLabel("Alive cats", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search cat name…")
+        lv.addWidget(self._search)
+        self._list = QListWidget()
+        lv.addWidget(self._list, 1)
+        root.addWidget(left)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(8)
+        self._title = QLabel("Safe Breeding")
+        self._title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#666; font-size:11px;")
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["Cat", "Risk%", "Shared Anc.", "Children will be"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setSortingEnabled(False)
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self._table.setItemDelegateForColumn(0, SafeBreedingView._ColumnPaddingDelegate(24, 8, self._table))
+        self._table.setColumnWidth(1, 80)
+        self._table.setColumnWidth(2, 110)
+        self._table.setItemDelegateForColumn(3, SafeBreedingView._ColumnPaddingDelegate(24, 0, self._table))
+
+        rv.addWidget(self._title)
+        rv.addWidget(self._summary)
+        rv.addWidget(self._table, 1)
+        root.addWidget(right, 1)
+
+        self._search.textChanged.connect(self._refresh_list)
+        self._list.currentItemChanged.connect(self._on_current_item_changed)
+        self._table.cellClicked.connect(self._on_table_row_clicked)
+        _enforce_min_font_in_widget_tree(self)
+
+    def set_cats(self, cats: list[Cat]):
+        selected_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            selected_key = int(cur.data(Qt.UserRole))
+        self._cats = cats
+        self._alive = sorted([c for c in cats if c.status != "Gone"], key=lambda c: (c.name or "").lower())
+        self._by_key = {c.db_key: c for c in self._alive}
+        self._refresh_list()
+        if selected_key is not None and selected_key in self._by_key:
+            self.select_cat(self._by_key[selected_key])
+        elif self._list.count():
+            self._list.setCurrentRow(0)
+        else:
+            self._render_for(None)
+
+    def select_cat(self, cat: Optional[Cat]):
+        if cat is None or cat.db_key not in self._by_key:
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if int(item.data(Qt.UserRole)) == cat.db_key:
+                self._list.setCurrentRow(i)
+                self._list.scrollToItem(item)
+                return
+
+    def _refresh_list(self):
+        query = self._search.text().strip().lower()
+        current_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            current_key = int(cur.data(Qt.UserRole))
+
+        self._list.clear()
+        for cat in self._alive:
+            if query and query not in cat.name.lower():
+                continue
+            item = QListWidgetItem(f"{cat.name}  ({cat.gender_display})")
+            item.setData(Qt.UserRole, cat.db_key)
+            self._list.addItem(item)
+        if self._list.count() == 0:
+            self._render_for(None)
+            return
+        if current_key is not None:
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if int(item.data(Qt.UserRole)) == current_key:
+                    self._list.setCurrentRow(i)
+                    return
+        self._list.setCurrentRow(0)
+
+    def _on_current_item_changed(self, current, previous):
+        if current is None:
+            self._render_for(None)
+            return
+        self._render_for(self._by_key.get(int(current.data(Qt.UserRole))))
+
+    def _on_table_row_clicked(self, row: int, _column: int):
+        if row < 0 or row >= len(self._table_row_cat_keys):
+            return
+        cat = self._by_key.get(self._table_row_cat_keys[row])
+        if cat is not None:
+            self.select_cat(cat)
+
+    def _render_for(self, cat: Optional[Cat]):
+        self._table.setRowCount(0)
+        self._table_row_cat_keys = []
+        if cat is None:
+            self._title.setText("Safe Breeding")
+            self._summary.setText("Select an alive cat.")
+            return
+
+        self._title.setText(f"Safe Breeding — {cat.name}")
+        candidates: list[tuple[float, int, int, Cat]] = []
+        for other in self._alive:
+            if other is cat:
+                continue
+            ok, _ = can_breed(cat, other)
+            if not ok:
+                continue
+            shared, recent_shared = shared_ancestor_counts(cat, other, recent_depth=3)
+            rel = risk_percent(cat, other)
+            closest_recent_gen = 0
+            if recent_shared:
+                da = _ancestor_depths(cat, max_depth=8)
+                db = _ancestor_depths(other, max_depth=8)
+                common = set(da.keys()) & set(db.keys())
+                recent_levels = [
+                    max(da[anc], db[anc])
+                    for anc in common
+                    if da[anc] <= 3 and db[anc] <= 3
+                ]
+                closest_recent_gen = min(recent_levels) if recent_levels else 3
+            # Sort by Risk% first so safest pairs appear at top.
+            candidates.append((rel, recent_shared * 1000 + shared, closest_recent_gen, other))
+        candidates.sort(key=lambda t: (t[0], t[1], (t[3].name or "").lower()))
+
+        self._summary.setText(
+            f"{len(candidates)} possible alive candidates  |  "
+            "Risk% = normalized CoI (0.25 => 100%)"
+        )
+        self._table.setRowCount(len(candidates))
+        for row, (rel, packed_shared, closest_recent_gen, other) in enumerate(candidates):
+            self._table_row_cat_keys.append(other.db_key)
+            shared = packed_shared % 1000
+            risk_pct = int(round(rel))
+            if risk_pct >= 100:
+                tag, col = "Highly Inbred", QColor(217, 119, 119)
+            elif risk_pct >= 50:
+                tag, col = "Moderately Inbred", QColor(216, 181, 106)
+            elif risk_pct >= 20:
+                tag, col = "Slightly Inbred", QColor(143, 201, 230)
+            else:
+                tag, col = "Not Inbred", QColor(98, 194, 135)
+
+            name_item = QTableWidgetItem(f"{other.name} ({other.gender_display})")
+            rel_item = QTableWidgetItem(f"{risk_pct}%")
+            shared_item = QTableWidgetItem(str(shared))
+            risk_item = QTableWidgetItem(tag)
+            rel_item.setData(Qt.UserRole, risk_pct)
+            shared_item.setData(Qt.UserRole, shared)
+            for it in (rel_item, shared_item, risk_item):
+                it.setTextAlignment(Qt.AlignCenter)
+            risk_item.setForeground(QBrush(col))
+            self._table.setItem(row, 0, name_item)
+            self._table.setItem(row, 1, rel_item)
+            self._table.setItem(row, 2, shared_item)
+            self._table.setItem(row, 3, risk_item)
 
 
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
@@ -1713,9 +2415,29 @@ class MainWindow(QMainWindow):
         self._room_btns: dict = {}
         self._active_btn = None
         self._show_lineage: bool = False
+        self._tree_view: Optional[FamilyTreeBrowserView] = None
+        self._safe_breeding_view: Optional[SafeBreedingView] = None
+        self._zoom_percent: int = 100
+        self._base_font: QFont = QApplication.instance().font()
+        self._base_sidebar_width = 190
+        self._base_header_height = 46
+        self._base_search_width = 180
+        self._base_col_widths = {
+            COL_NAME: 130,
+            COL_GEN: _W_GEN,
+            COL_STAT: _W_STATUS,
+            COL_SUM: 38,
+            COL_ABIL: 180,
+            COL_MUTS: 155,
+            COL_REL: _W_REL,
+            COL_AGE: 34,
+            COL_INB: 38,
+            **{c: _W_STAT for c in STAT_COLS},
+        }
 
         self._build_ui()
         self._build_menu()
+        self._apply_zoom()
 
         self._watcher = QFileSystemWatcher(self)
         self._watcher.fileChanged.connect(self._on_file_changed)
@@ -1752,6 +2474,38 @@ class MainWindow(QMainWindow):
         self._lineage_action.triggered.connect(self._toggle_lineage)
         sm.addAction(self._lineage_action)
 
+        sm.addSeparator()
+        zoom_in = QAction("Zoom In", self)
+        zoom_in_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.ZoomIn)
+        if not zoom_in_keys:
+            zoom_in_keys = []
+        for seq in (QKeySequence("Ctrl+="), QKeySequence("Ctrl++")):
+            if seq not in zoom_in_keys:
+                zoom_in_keys.append(seq)
+        zoom_in.setShortcuts(zoom_in_keys)
+        zoom_in.triggered.connect(lambda: self._change_zoom(+1))
+        sm.addAction(zoom_in)
+
+        zoom_out = QAction("Zoom Out", self)
+        zoom_out_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.ZoomOut)
+        if not zoom_out_keys:
+            zoom_out_keys = []
+        if QKeySequence("Ctrl+-") not in zoom_out_keys:
+            zoom_out_keys.append(QKeySequence("Ctrl+-"))
+        zoom_out.setShortcuts(zoom_out_keys)
+        zoom_out.triggered.connect(lambda: self._change_zoom(-1))
+        sm.addAction(zoom_out)
+
+        zoom_reset = QAction("Reset Zoom", self)
+        zoom_reset.setShortcut("Ctrl+0")
+        zoom_reset.triggered.connect(self._reset_zoom)
+        sm.addAction(zoom_reset)
+
+        self._zoom_info_action = QAction("", self)
+        self._zoom_info_action.setEnabled(False)
+        sm.addAction(self._zoom_info_action)
+        self._update_zoom_info_action()
+
     # ── Layout ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -1768,12 +2522,14 @@ class MainWindow(QMainWindow):
         hs.setStretchFactor(0, 0)
         hs.setStretchFactor(1, 1)
         hs.setSizes([190, 1250])
+        _enforce_min_font_in_widget_tree(central)
 
     # ── Sidebar ────────────────────────────────────────────────────────────
 
     def _build_sidebar(self) -> QWidget:
         w  = QWidget()
-        w.setFixedWidth(190)
+        self._sidebar = w
+        w.setFixedWidth(self._base_sidebar_width)
         w.setStyleSheet("background:#14142a;")
         vb = QVBoxLayout(w)
         vb.setContentsMargins(8, 14, 8, 12)
@@ -1798,6 +2554,13 @@ class MainWindow(QMainWindow):
         self._btn_all.clicked.connect(lambda: self._filter(None, self._btn_all))
         vb.addWidget(self._btn_all)
         self._room_btns[None] = self._btn_all
+
+        self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
+        self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
+        vb.addWidget(self._btn_safe_breeding_view)
+        self._btn_tree_view = _sidebar_btn("Family Tree View")
+        self._btn_tree_view.clicked.connect(self._open_tree_browser)
+        vb.addWidget(self._btn_tree_view)
 
         vb.addWidget(_hsep())
         vb.addWidget(sl("ROOMS"))
@@ -1866,8 +2629,9 @@ class MainWindow(QMainWindow):
 
         # Header
         hdr = QWidget()
+        self._header = hdr
         hdr.setStyleSheet("background:#16213e; border-bottom:1px solid #1e1e38;")
-        hdr.setFixedHeight(46)
+        hdr.setFixedHeight(self._base_header_height)
         hb = QHBoxLayout(hdr); hb.setContentsMargins(14, 0, 14, 0)
         self._header_lbl = QLabel("All Cats")
         self._header_lbl.setStyleSheet("color:#eee; font-size:15px; font-weight:bold;")
@@ -1878,7 +2642,7 @@ class MainWindow(QMainWindow):
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search…")
         self._search.setClearButtonEnabled(True)
-        self._search.setFixedWidth(180)
+        self._search.setFixedWidth(self._base_search_width)
         self._search.setStyleSheet(
             "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
             " border-radius:4px; padding:3px 8px; font-size:12px; }"
@@ -1896,6 +2660,7 @@ class MainWindow(QMainWindow):
         vs.setHandleWidth(4)
         vs.setStyleSheet("QSplitter::handle:vertical { background:#1e1e38; }")
         self._detail_splitter = vs
+        self._table_view_container = vs
         vb.addWidget(vs)
 
         # Table
@@ -1922,7 +2687,7 @@ class MainWindow(QMainWindow):
         # Name: interactive so the user can resize it; not Stretch so it
         # doesn't eat the blank space that should sit at the right edge.
         hh.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
-        self._table.setColumnWidth(COL_NAME, 130)
+        self._table.setColumnWidth(COL_NAME, self._base_col_widths[COL_NAME])
 
         # Room: size to content so it adapts to room name length
         hh.setSectionResizeMode(COL_ROOM, QHeaderView.ResizeToContents)
@@ -1935,15 +2700,19 @@ class MainWindow(QMainWindow):
 
         # Abilities: interactive — user drags to taste
         hh.setSectionResizeMode(COL_ABIL, QHeaderView.Interactive)
-        self._table.setColumnWidth(COL_ABIL, 180)
+        self._table.setColumnWidth(COL_ABIL, self._base_col_widths[COL_ABIL])
 
         # Mutations: interactive
         hh.setSectionResizeMode(COL_MUTS, QHeaderView.Interactive)
-        self._table.setColumnWidth(COL_MUTS, 155)
+        self._table.setColumnWidth(COL_MUTS, self._base_col_widths[COL_MUTS])
+
+        # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
+        hh.setSectionResizeMode(COL_REL, QHeaderView.Fixed)
+        self._table.setColumnWidth(COL_REL, self._base_col_widths[COL_REL])
 
         # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
         hh.setSectionResizeMode(COL_AGE, QHeaderView.Fixed)
-        self._table.setColumnWidth(COL_AGE, 34)
+        self._table.setColumnWidth(COL_AGE, self._base_col_widths[COL_AGE])
         self._table.setColumnHidden(COL_AGE, True)
 
         # Source: Stretch — absorbs blank space, hidden by default (behind lineage toggle)
@@ -1952,7 +2721,7 @@ class MainWindow(QMainWindow):
 
         # Inbreeding score: fixed narrow, hidden by default
         hh.setSectionResizeMode(COL_INB, QHeaderView.Fixed)
-        self._table.setColumnWidth(COL_INB, 38)
+        self._table.setColumnWidth(COL_INB, self._base_col_widths[COL_INB])
         self._table.setColumnHidden(COL_INB, True)
 
         self._table.setStyleSheet("""
@@ -1986,6 +2755,15 @@ class MainWindow(QMainWindow):
         vs.setStretchFactor(0, 1)
         vs.setStretchFactor(1, 0)
 
+        # Family tree view lives in the same main container and is swapped in/out
+        # via left sidebar "VIEW" buttons.
+        self._tree_view = FamilyTreeBrowserView(self)
+        self._tree_view.hide()
+        vb.addWidget(self._tree_view, 1)
+        self._safe_breeding_view = SafeBreedingView(self)
+        self._safe_breeding_view.hide()
+        vb.addWidget(self._safe_breeding_view, 1)
+
         return w
 
     # ── Selection → detail ────────────────────────────────────────────────
@@ -2006,10 +2784,15 @@ class MainWindow(QMainWindow):
         # Highlight compatibility: dim incompatible cats when 1 is selected
         focus = cats[0] if len(cats) == 1 else None
         self._source_model.set_focus_cat(focus)
+        if self._tree_view is not None and self._tree_view.isVisible() and focus is not None:
+            self._tree_view.select_cat(focus)
+        if self._safe_breeding_view is not None and self._safe_breeding_view.isVisible() and focus is not None:
+            self._safe_breeding_view.select_cat(focus)
 
     # ── Filtering ──────────────────────────────────────────────────────────
 
     def _filter(self, room_key, btn: QPushButton):
+        self._show_table_view()
         if self._active_btn and self._active_btn is not btn:
             self._active_btn.setChecked(False)
         btn.setChecked(True)
@@ -2019,6 +2802,56 @@ class MainWindow(QMainWindow):
         self._update_count()
         self._detail.show_cats([])
         self._source_model.set_focus_cat(None)
+
+    def _show_table_view(self):
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if hasattr(self, "_header"):
+            self._header.show()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+
+    def _show_tree_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if self._tree_view is not None:
+            self._tree_view.set_cats(self._cats)
+            self._tree_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(True)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+
+    def _show_safe_breeding_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if self._safe_breeding_view is not None:
+            self._safe_breeding_view.set_cats(self._cats)
+            self._safe_breeding_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(True)
 
     def _update_header(self, room_key):
         if room_key == "__all__":
@@ -2066,6 +2899,10 @@ class MainWindow(QMainWindow):
             self._btn_adventure.setText(f"On Adventure  ({adv})")
             self._btn_gone.setText(f"Gone  ({gone})")
             self._filter(None, self._btn_all)
+            if self._tree_view is not None:
+                self._tree_view.set_cats(cats)
+            if self._safe_breeding_view is not None:
+                self._safe_breeding_view.set_cats(cats)
 
             name = os.path.basename(path)
             self._save_lbl.setText(name)
@@ -2102,6 +2939,72 @@ class MainWindow(QMainWindow):
     def _on_file_changed(self, path: str):
         if path == self._current_save:
             self._reload()
+
+    def _open_tree_browser(self):
+        self._show_tree_view()
+        rows = list({
+            self._proxy_model.mapToSource(idx).row()
+            for idx in self._table.selectionModel().selectedRows()
+        })
+        cats = [c for r in rows[:1] if (c := self._source_model.cat_at(r)) is not None]
+        if cats and self._tree_view is not None:
+            self._tree_view.select_cat(cats[0])
+
+    def _open_safe_breeding_view(self):
+        self._show_safe_breeding_view()
+        rows = list({
+            self._proxy_model.mapToSource(idx).row()
+            for idx in self._table.selectionModel().selectedRows()
+        })
+        cats = [c for r in rows[:1] if (c := self._source_model.cat_at(r)) is not None]
+        if cats and self._safe_breeding_view is not None:
+            self._safe_breeding_view.select_cat(cats[0])
+
+    # ── UI zoom ───────────────────────────────────────────────────────────
+
+    def _scaled(self, value: int) -> int:
+        return max(1, round(value * (self._zoom_percent / 100.0)))
+
+    def _update_zoom_info_action(self):
+        if hasattr(self, "_zoom_info_action"):
+            self._zoom_info_action.setText(f"Zoom: {self._zoom_percent}%")
+
+    def _set_zoom(self, percent: int):
+        clamped = max(_ZOOM_MIN, min(_ZOOM_MAX, int(percent)))
+        if clamped == self._zoom_percent:
+            return
+        self._zoom_percent = clamped
+        self._apply_zoom()
+        self._update_zoom_info_action()
+        self.statusBar().showMessage(f"UI zoom set to {self._zoom_percent}%")
+
+    def _change_zoom(self, direction: int):
+        self._set_zoom(self._zoom_percent + (direction * _ZOOM_STEP))
+
+    def _reset_zoom(self):
+        self._set_zoom(100)
+
+    def _apply_zoom(self):
+        app = QApplication.instance()
+        font = QFont(self._base_font)
+        base_pt = self._base_font.pointSizeF()
+        if base_pt > 0:
+            font.setPointSizeF(max(_ACCESSIBILITY_MIN_FONT_PT, base_pt * (self._zoom_percent / 100.0)))
+        elif self._base_font.pixelSize() > 0:
+            font.setPixelSize(max(_ACCESSIBILITY_MIN_FONT_PX, self._scaled(self._base_font.pixelSize())))
+        app.setFont(font)
+
+        if hasattr(self, "_sidebar"):
+            self._sidebar.setFixedWidth(self._scaled(self._base_sidebar_width))
+        if hasattr(self, "_header"):
+            self._header.setFixedHeight(self._scaled(self._base_header_height))
+        if hasattr(self, "_search"):
+            self._search.setFixedWidth(self._scaled(self._base_search_width))
+        if hasattr(self, "_table"):
+            for col, width in self._base_col_widths.items():
+                self._table.setColumnWidth(col, self._scaled(width))
+            self._table.verticalHeader().setDefaultSectionSize(self._scaled(24))
+        _enforce_min_font_in_widget_tree(self)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
