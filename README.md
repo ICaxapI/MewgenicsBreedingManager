@@ -28,6 +28,12 @@ Select a cat from the list and switch to **Family Tree View** in the sidebar to 
 
 The **Safe Breeding** panel ranks all viable alive partners for the selected cat by ascending inbreeding risk. Columns show **Risk%** (normalized Wright's Coefficient of Inbreeding), **Shared Ancestors** count, and a plain-language label — *Not Inbred*, *Slightly Inbred*, *Moderately Inbred*, etc. — so you can immediately pick the safest pairing.
 
+### Room Optimizer
+![Room Optimizer](Sceenshots/Room%20Optimizer.png)
+
+The **Room Optimize** panel optimizes cat placement to reduce inbredness. Columns show Pairs, Attribute ranges, Total Stat Ranges, Average Stat, and Inbred Chance.
+
+
 ## Features
 
 - **Live save reading** — watches the save file and reloads automatically when the game writes
