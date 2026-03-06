@@ -2825,7 +2825,7 @@ class RoomOptimizerView(QWidget):
         controls = QHBoxLayout()
         controls.setSpacing(8)
 
-        self._min_stats_label = QLabel("Min total stats:")
+        self._min_stats_label = QLabel("Min base stats:")
         self._min_stats_label.setStyleSheet("color:#888; font-size:11px;")
         controls.addWidget(self._min_stats_label)
 
@@ -2852,6 +2852,19 @@ class RoomOptimizerView(QWidget):
             " border-radius:4px; padding:4px 8px; }"
         )
         controls.addWidget(self._max_risk_input)
+
+        controls.addSpacing(16)
+
+        self._minimize_variance_checkbox = QPushButton("Minimize Variance")
+        self._minimize_variance_checkbox.setCheckable(True)
+        self._minimize_variance_checkbox.setChecked(False)
+        self._minimize_variance_checkbox.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#2a4a5a; color:#ddd; border:1px solid #4a6a7a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        controls.addWidget(self._minimize_variance_checkbox)
 
         self._optimize_btn = QPushButton("Calculate Optimal Distribution")
         self._optimize_btn.clicked.connect(self._calculate_optimal_distribution)
@@ -2955,9 +2968,12 @@ class RoomOptimizerView(QWidget):
         except ValueError:
             pass
 
+        # Get minimize variance option
+        minimize_variance = self._minimize_variance_checkbox.isChecked()
+
         # Filter cats by minimum stats
         if min_stats > 0:
-            alive_cats = [c for c in alive_cats if sum(c.total_stats.values()) >= min_stats]
+            alive_cats = [c for c in alive_cats if sum(c.base_stats.values()) >= min_stats]
 
         if len(alive_cats) < 2:
             self._table.setRowCount(0)
@@ -2969,10 +2985,10 @@ class RoomOptimizerView(QWidget):
         females = [c for c in alive_cats if c.gender == "female"]
         unknown = [c for c in alive_cats if c.gender == "?"]
 
-        # Sort by total stats (best first)
-        males.sort(key=lambda c: sum(c.total_stats.values()), reverse=True)
-        females.sort(key=lambda c: sum(c.total_stats.values()), reverse=True)
-        unknown.sort(key=lambda c: sum(c.total_stats.values()), reverse=True)
+        # Sort by base stats (best first)
+        males.sort(key=lambda c: sum(c.base_stats.values()), reverse=True)
+        females.sort(key=lambda c: sum(c.base_stats.values()), reverse=True)
+        unknown.sort(key=lambda c: sum(c.base_stats.values()), reverse=True)
 
         # Priority rooms + fallback
         priority_rooms = ["Priority 1", "Priority 2", "Priority 3", "Priority 4"]
@@ -2995,13 +3011,24 @@ class RoomOptimizerView(QWidget):
                 if risk > max_risk:
                     continue
 
-                avg_stats = (sum(cat_a.total_stats.values()) + sum(cat_b.total_stats.values())) / 2
-                quality = avg_stats * (1.0 - risk / 200.0)
+                # Use base stats for breeding calculations (offspring inherit base stats)
+                avg_base_stats = (sum(cat_a.base_stats.values()) + sum(cat_b.base_stats.values())) / 2
+
+                # Calculate variance penalty if minimize_variance is enabled
+                variance_penalty = 0.0
+                if minimize_variance:
+                    # Penalize pairs with large stat gaps (prefer 7+7 over 4+7)
+                    for stat in STAT_NAMES:
+                        gap = abs(cat_a.base_stats[stat] - cat_b.base_stats[stat])
+                        if gap > 2:
+                            variance_penalty += gap * 2.0
+
+                quality = avg_base_stats * (1.0 - risk / 200.0) - variance_penalty
                 pairs_with_scores.append({
                     'cat_a': cat_a,
                     'cat_b': cat_b,
                     'risk': risk,
-                    'avg_stats': avg_stats,
+                    'avg_stats': avg_base_stats,
                     'quality': quality
                 })
 
@@ -3086,7 +3113,8 @@ class RoomOptimizerView(QWidget):
                     ok, _ = can_breed(cat_a, cat_b)
                     if ok:
                         risk = risk_percent(cat_a, cat_b)
-                        avg_stats = (sum(cat_a.total_stats.values()) + sum(cat_b.total_stats.values())) / 2
+                        # Use base stats for offspring predictions
+                        avg_base_stats = (sum(cat_a.base_stats.values()) + sum(cat_b.base_stats.values())) / 2
                         stat_ranges = {
                             stat: (
                                 min(cat_a.base_stats[stat], cat_b.base_stats[stat]),
@@ -3100,7 +3128,7 @@ class RoomOptimizerView(QWidget):
                             'cat_a': cat_a,
                             'cat_b': cat_b,
                             'risk': risk,
-                            'avg_stats': avg_stats,
+                            'avg_stats': avg_base_stats,
                             'stat_ranges': stat_ranges,
                             'sum_range': (sum_lo, sum_hi),
                         })
