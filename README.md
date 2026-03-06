@@ -46,6 +46,7 @@ The **Room Optimize** panel optimizes cat placement to reduce inbredness. Column
 - **Risk% column** — inbreeding risk percentage for every cat relative to the selected one, using Wright's Coefficient of Inbreeding
 - **Safe Breeding view** — sidebar panel that ranks all valid alive partners for a selected cat by ascending risk, with shared ancestor counts and plain-language labels
 - **Family Tree view** — visual generational tree (self → children → grandchildren) with click-to-navigate boxes
+- **Calibration view** — override parser values (gender/age/aggression/libido/inbredness) for alive cats, persist per save, and export/import calibration JSON; learned gender token hints improve future parsing
 - **UI zoom** — Ctrl+= / Ctrl+- / Ctrl+0 to scale the entire interface from 70%–200%
 
 ## Requirements
@@ -73,6 +74,18 @@ The app auto-detects your save file from:
 ```
 
 Use **File → Open Save File** to load a different save, or **File → Reload** (F5) to force a refresh.
+
+## Field Mapping Toolkit
+
+If you want to reverse-engineer hidden save fields (gender variants, libido, aggression, age, inbredness, gayness, abilities, mutations, disorders), use:
+
+`tools/field_mapper/README.md`
+
+It includes scripts for:
+- bulk `.sav` ingestion into SQLite,
+- CSV labeling workflow,
+- brute-force offset discovery for scalar traits,
+- token mapping analysis for abilities/mutations/disorders.
 
 ### Roster table
 | Column | Description |
