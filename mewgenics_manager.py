@@ -2595,6 +2595,25 @@ class RoomOptimizerView(QWidget):
 
         controls.addSpacing(16)
 
+        self._mode_toggle_btn = QPushButton("Mode: Pair Quality")
+        self._mode_toggle_btn.setCheckable(True)
+        self._mode_toggle_btn.setChecked(False)
+        self._mode_toggle_btn.setToolTip(
+            "Toggle optimizer mode:\n"
+            "Pair Quality = best pair scoring\n"
+            "Family Separation = spread family lines across rooms"
+        )
+        self._mode_toggle_btn.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#3a2f54; color:#ddd; border:1px solid #6a5a9a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._mode_toggle_btn.toggled.connect(self._on_optimizer_mode_toggled)
+        controls.addWidget(self._mode_toggle_btn)
+
+        controls.addSpacing(8)
+
         self._minimize_variance_checkbox = QPushButton("Minimize Variance")
         self._minimize_variance_checkbox.setCheckable(True)
         self._minimize_variance_checkbox.setChecked(False)
@@ -2656,6 +2675,19 @@ class RoomOptimizerView(QWidget):
         root.addWidget(self._splitter, 1)
 
         _enforce_min_font_in_widget_tree(self)
+
+    def _on_optimizer_mode_toggled(self, enabled: bool):
+        if enabled:
+            self._mode_toggle_btn.setText("Mode: Family Separation")
+            self._minimize_variance_checkbox.setChecked(False)
+            self._minimize_variance_checkbox.setEnabled(False)
+            self._minimize_variance_checkbox.setToolTip(
+                "Variance minimization is available in Pair Quality mode only."
+            )
+        else:
+            self._mode_toggle_btn.setText("Mode: Pair Quality")
+            self._minimize_variance_checkbox.setEnabled(True)
+            self._minimize_variance_checkbox.setToolTip("")
 
     def _on_table_selection_changed(self):
         selected_ranges = self._table.selectedRanges()
@@ -2730,106 +2762,225 @@ class RoomOptimizerView(QWidget):
         females.sort(key=lambda c: sum(c.base_stats.values()), reverse=True)
         unknown.sort(key=lambda c: sum(c.base_stats.values()), reverse=True)
 
-        # Priority rooms + fallback
-        priority_rooms = ["Priority 1", "Priority 2", "Priority 3", "Priority 4"]
-        fallback_room = "Fallback"
-        all_rooms = priority_rooms + [fallback_room]
-        room_assignments = {room: [] for room in all_rooms}
+        mode_family = self._mode_toggle_btn.isChecked()
 
-        # Strategy: Find best breeding pairs and distribute to priority rooms
-        # Maximize expected offspring quality while respecting risk constraints
-        all_cats = males + females + unknown
-        pairs_with_scores = []
+        if mode_family:
+            # Family-separation mode uses real in-game rooms and tries to spread lineages.
+            all_rooms = list(ROOM_DISPLAY.keys())
+            fallback_room = None
+            max_cats_per_room = 6
+            family_assignments = {
+                room: {"males": [], "females": [], "unknown": []}
+                for room in all_rooms
+            }
 
-        for i, cat_a in enumerate(all_cats):
-            for cat_b in all_cats[i+1:]:
-                ok, _ = can_breed(cat_a, cat_b)
-                if not ok:
-                    continue
+            def _room_cats(room_key: str) -> list[Cat]:
+                room_data = family_assignments[room_key]
+                return room_data["males"] + room_data["females"] + room_data["unknown"]
 
-                risk = risk_percent(cat_a, cat_b)
-                if risk > max_risk:
-                    continue
+            def _family_group_id(cat: Cat):
+                ancestors = []
+                if cat.parent_a:
+                    ancestors.append(cat.parent_a.db_key)
+                if cat.parent_b:
+                    ancestors.append(cat.parent_b.db_key)
+                for p in (cat.parent_a, cat.parent_b):
+                    if p:
+                        if p.parent_a:
+                            ancestors.append(p.parent_a.db_key)
+                        if p.parent_b:
+                            ancestors.append(p.parent_b.db_key)
+                return tuple(sorted(ancestors)) if ancestors else None
 
-                # Use base stats for breeding calculations (offspring inherit base stats)
-                avg_base_stats = (sum(cat_a.base_stats.values()) + sum(cat_b.base_stats.values())) / 2
+            room_idx = 0
+            for gender_list, gender_key in (
+                (males, "males"),
+                (females, "females"),
+                (unknown, "unknown"),
+            ):
+                family_groups: dict[tuple, list[Cat]] = {}
+                no_family: list[Cat] = []
 
-                # Calculate variance penalty if minimize_variance is enabled
-                variance_penalty = 0.0
-                if minimize_variance:
-                    # Penalize pairs with large stat gaps (prefer 7+7 over 4+7)
-                    for stat in STAT_NAMES:
-                        gap = abs(cat_a.base_stats[stat] - cat_b.base_stats[stat])
-                        if gap > 2:
-                            variance_penalty += gap * 2.0
+                for cat in gender_list:
+                    family_id = _family_group_id(cat)
+                    if family_id:
+                        family_groups.setdefault(family_id, []).append(cat)
+                    else:
+                        no_family.append(cat)
 
-                quality = avg_base_stats * (1.0 - risk / 200.0) - variance_penalty
-                pairs_with_scores.append({
-                    'cat_a': cat_a,
-                    'cat_b': cat_b,
-                    'risk': risk,
-                    'avg_stats': avg_base_stats,
-                    'quality': quality
-                })
+                # Place known family groups first, minimizing same-family room collisions.
+                for family_id, family_cats in family_groups.items():
+                    for cat in family_cats:
+                        placed = False
+                        for _ in range(len(all_rooms)):
+                            room = all_rooms[room_idx % len(all_rooms)]
+                            room_cats = _room_cats(room)
+                            if len(room_cats) < max_cats_per_room:
+                                has_family_conflict = False
+                                has_risk_conflict = False
+                                for existing_cat in room_cats:
+                                    if _family_group_id(existing_cat) == family_id:
+                                        has_family_conflict = True
+                                        break
+                                    if risk_percent(cat, existing_cat) > max_risk:
+                                        has_risk_conflict = True
+                                        break
+                                if not has_family_conflict and not has_risk_conflict:
+                                    family_assignments[room][gender_key].append(cat)
+                                    placed = True
+                                    room_idx += 1
+                                    break
+                            room_idx += 1
 
-        pairs_with_scores.sort(key=lambda p: p['quality'], reverse=True)
-        assigned_cats = set()
-        max_cats_per_priority_room = 6
+                        if not placed:
+                            best_room = None
+                            best_avg_risk = float("inf")
+                            for room in all_rooms:
+                                room_cats = _room_cats(room)
+                                if len(room_cats) >= max_cats_per_room:
+                                    continue
+                                risks = [risk_percent(cat, existing_cat) for existing_cat in room_cats]
+                                avg_risk = (sum(risks) / len(risks)) if risks else 0.0
+                                if avg_risk < best_avg_risk:
+                                    best_avg_risk = avg_risk
+                                    best_room = room
+                            if best_room is None:
+                                best_room = min(all_rooms, key=lambda r: len(_room_cats(r)))
+                            family_assignments[best_room][gender_key].append(cat)
 
-        for pair in pairs_with_scores:
-            cat_a = pair['cat_a']
-            cat_b = pair['cat_b']
-            if cat_a.db_key in assigned_cats or cat_b.db_key in assigned_cats:
-                continue
-
-            placed = False
-            for room in priority_rooms:
-                room_cats = room_assignments[room]
-                if len(room_cats) >= max_cats_per_priority_room:
-                    continue
-
-                can_place_both = True
-                for existing_cat in room_cats:
-                    ok_a, _ = can_breed(cat_a, existing_cat)
-                    if ok_a and risk_percent(cat_a, existing_cat) > max_risk:
-                        can_place_both = False
-                        break
-
-                    ok_b, _ = can_breed(cat_b, existing_cat)
-                    if ok_b and risk_percent(cat_b, existing_cat) > max_risk:
-                        can_place_both = False
-                        break
-
-                if can_place_both and len(room_cats) + 2 <= max_cats_per_priority_room:
-                    room_assignments[room].extend([cat_a, cat_b])
-                    assigned_cats.add(cat_a.db_key)
-                    assigned_cats.add(cat_b.db_key)
-                    placed = True
-                    break
-
-            if not placed:
-                for cat in [cat_a, cat_b]:
-                    if cat.db_key in assigned_cats:
-                        continue
-                    for room in priority_rooms:
-                        room_cats = room_assignments[room]
-                        if len(room_cats) >= max_cats_per_priority_room:
-                            continue
-
-                        compatible = True
-                        for existing_cat in room_cats:
-                            ok, _ = can_breed(cat, existing_cat)
-                            if ok and risk_percent(cat, existing_cat) > max_risk:
-                                compatible = False
+                # Then place strays / no-family cats by lowest-risk fit.
+                for cat in no_family:
+                    placed = False
+                    for _ in range(len(all_rooms)):
+                        room = all_rooms[room_idx % len(all_rooms)]
+                        room_cats = _room_cats(room)
+                        if len(room_cats) < max_cats_per_room:
+                            has_risk_conflict = False
+                            for existing_cat in room_cats:
+                                if risk_percent(cat, existing_cat) > max_risk:
+                                    has_risk_conflict = True
+                                    break
+                            if not has_risk_conflict:
+                                family_assignments[room][gender_key].append(cat)
+                                placed = True
+                                room_idx += 1
                                 break
-                        if compatible:
-                            room_assignments[room].append(cat)
-                            assigned_cats.add(cat.db_key)
+                        room_idx += 1
+
+                    if not placed:
+                        best_room = None
+                        best_avg_risk = float("inf")
+                        for room in all_rooms:
+                            room_cats = _room_cats(room)
+                            if len(room_cats) >= max_cats_per_room:
+                                continue
+                            risks = [risk_percent(cat, existing_cat) for existing_cat in room_cats]
+                            avg_risk = (sum(risks) / len(risks)) if risks else 0.0
+                            if avg_risk < best_avg_risk:
+                                best_avg_risk = avg_risk
+                                best_room = room
+                        if best_room is None:
+                            best_room = min(all_rooms, key=lambda r: len(_room_cats(r)))
+                        family_assignments[best_room][gender_key].append(cat)
+
+            room_assignments = {room: _room_cats(room) for room in all_rooms}
+
+        else:
+            # Pair-quality mode (existing behavior): score breeding pairs then place.
+            priority_rooms = ["Priority 1", "Priority 2", "Priority 3", "Priority 4"]
+            fallback_room = "Fallback"
+            all_rooms = priority_rooms + [fallback_room]
+            room_assignments = {room: [] for room in all_rooms}
+
+            all_cats = males + females + unknown
+            pairs_with_scores = []
+
+            for i, cat_a in enumerate(all_cats):
+                for cat_b in all_cats[i+1:]:
+                    ok, _ = can_breed(cat_a, cat_b)
+                    if not ok:
+                        continue
+
+                    risk = risk_percent(cat_a, cat_b)
+                    if risk > max_risk:
+                        continue
+
+                    avg_base_stats = (sum(cat_a.base_stats.values()) + sum(cat_b.base_stats.values())) / 2
+
+                    variance_penalty = 0.0
+                    if minimize_variance:
+                        for stat in STAT_NAMES:
+                            gap = abs(cat_a.base_stats[stat] - cat_b.base_stats[stat])
+                            if gap > 2:
+                                variance_penalty += gap * 2.0
+
+                    quality = avg_base_stats * (1.0 - risk / 200.0) - variance_penalty
+                    pairs_with_scores.append({
+                        'cat_a': cat_a,
+                        'cat_b': cat_b,
+                        'risk': risk,
+                        'avg_stats': avg_base_stats,
+                        'quality': quality
+                    })
+
+            pairs_with_scores.sort(key=lambda p: p['quality'], reverse=True)
+            assigned_cats = set()
+            max_cats_per_priority_room = 6
+
+            for pair in pairs_with_scores:
+                cat_a = pair['cat_a']
+                cat_b = pair['cat_b']
+                if cat_a.db_key in assigned_cats or cat_b.db_key in assigned_cats:
+                    continue
+
+                placed = False
+                for room in priority_rooms:
+                    room_cats = room_assignments[room]
+                    if len(room_cats) >= max_cats_per_priority_room:
+                        continue
+
+                    can_place_both = True
+                    for existing_cat in room_cats:
+                        ok_a, _ = can_breed(cat_a, existing_cat)
+                        if ok_a and risk_percent(cat_a, existing_cat) > max_risk:
+                            can_place_both = False
                             break
 
-        for cat in all_cats:
-            if cat.db_key not in assigned_cats:
-                room_assignments[fallback_room].append(cat)
+                        ok_b, _ = can_breed(cat_b, existing_cat)
+                        if ok_b and risk_percent(cat_b, existing_cat) > max_risk:
+                            can_place_both = False
+                            break
+
+                    if can_place_both and len(room_cats) + 2 <= max_cats_per_priority_room:
+                        room_assignments[room].extend([cat_a, cat_b])
+                        assigned_cats.add(cat_a.db_key)
+                        assigned_cats.add(cat_b.db_key)
+                        placed = True
+                        break
+
+                if not placed:
+                    for cat in [cat_a, cat_b]:
+                        if cat.db_key in assigned_cats:
+                            continue
+                        for room in priority_rooms:
+                            room_cats = room_assignments[room]
+                            if len(room_cats) >= max_cats_per_priority_room:
+                                continue
+
+                            compatible = True
+                            for existing_cat in room_cats:
+                                ok, _ = can_breed(cat, existing_cat)
+                                if ok and risk_percent(cat, existing_cat) > max_risk:
+                                    compatible = False
+                                    break
+                            if compatible:
+                                room_assignments[room].append(cat)
+                                assigned_cats.add(cat.db_key)
+                                break
+
+            for cat in all_cats:
+                if cat.db_key not in assigned_cats:
+                    room_assignments[fallback_room].append(cat)
 
         # Display results
         self._table.setRowCount(0)
@@ -2881,9 +3032,10 @@ class RoomOptimizerView(QWidget):
             self._table.insertRow(row_idx)
 
             # Room name
-            room_item = QTableWidgetItem(room)
+            room_label = ROOM_DISPLAY.get(room, room)
+            room_item = QTableWidgetItem(room_label)
             room_item.setTextAlignment(Qt.AlignCenter)
-            if room == fallback_room:
+            if fallback_room is not None and room == fallback_room:
                 room_item.setForeground(QBrush(QColor(150, 150, 150)))
 
             # Cats to place
@@ -2895,7 +3047,7 @@ class RoomOptimizerView(QWidget):
             pairs_item.setTextAlignment(Qt.AlignCenter)
 
             # Average stats of expected offspring
-            avg_room_stats = sum(p['avg_stats'] for p in room_pairs) / len(room_pairs)
+            avg_room_stats = (sum(p['avg_stats'] for p in room_pairs) / len(room_pairs)) if room_pairs else 0.0
             stats_item = QTableWidgetItem(f"{avg_room_stats:.1f}")
             stats_item.setTextAlignment(Qt.AlignCenter)
 
@@ -2908,7 +3060,7 @@ class RoomOptimizerView(QWidget):
                 stats_item.setForeground(QBrush(QColor(190, 145, 40)))
 
             # Average risk
-            avg_risk = sum(p['risk'] for p in room_pairs) / len(room_pairs)
+            avg_risk = (sum(p['risk'] for p in room_pairs) / len(room_pairs)) if room_pairs else 0.0
             risk_item = QTableWidgetItem(f"{avg_risk:.0f}%")
             risk_item.setTextAlignment(Qt.AlignCenter)
 
@@ -2935,7 +3087,7 @@ class RoomOptimizerView(QWidget):
                 details_lines.append(f"... and {len(room_pairs) - 3} more")
             details_item = QTableWidgetItem("; ".join(details_lines))
             room_item.setData(Qt.UserRole, {
-                "room": room,
+                "room": room_label,
                 "cats": cat_names,
                 "total_pairs": len(room_pairs),
                 "avg_stats": avg_room_stats,
@@ -2996,11 +3148,13 @@ class RoomOptimizerView(QWidget):
             row_idx += 1
 
         # Calculate stats
-        filter_info = []
+        filter_info = [f"mode: {'family separation' if mode_family else 'pair quality'}"]
         if min_stats > 0:
             filter_info.append(f"min stats: {min_stats}")
         if max_risk < 100:
             filter_info.append(f"max risk: {max_risk}%")
+        if (not mode_family) and minimize_variance:
+            filter_info.append("variance: on")
 
         filter_str = f"  |  Filters: {', '.join(filter_info)}" if filter_info else ""
 
