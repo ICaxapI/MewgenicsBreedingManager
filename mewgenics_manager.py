@@ -15,6 +15,7 @@ import csv
 import json
 import lz4.block
 import os
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -569,6 +570,7 @@ class Cat:
         _name_end = r.pos   # used below for reliable sex u16 read at _name_end+8
 
         r.str()  # unknown string between name and parent refs
+        personality_anchor = r.pos
 
         # Possible parent UIDs — fixed-position attempt.
         # parse_save will run a blob scan as a fallback if these don't resolve.
@@ -607,11 +609,27 @@ class Cat:
                             for i, n in enumerate(STAT_NAMES)}
 
         # Personality stats (age, aggression, libido, inbredness).
-        # Exact offsets not yet documented; filled in by parse_save if found.
+        # These three traits are doubles anchored after the unknown post-name string.
+        # age offset remains unknown and is left unset.
         self.age         = None
         self.aggression  = None   # None = unknown
         self.libido      = None
         self.inbredness  = None
+        def _read_personality(offset: int) -> Optional[float]:
+            i = personality_anchor + offset
+            if i + 8 > len(raw):
+                return None
+            try:
+                v = struct.unpack_from('<d', raw, i)[0]
+            except Exception:
+                return None
+            if not math.isfinite(v) or not (0.0 <= v <= 1.0):
+                return None
+            return float(v)
+
+        self.libido = _read_personality(32)
+        self.inbredness = _read_personality(40)
+        self.aggression = _read_personality(64)
 
         # Parsed baseline values (before any manual calibration overrides).
         self.parsed_gender = self.gender
