@@ -10,9 +10,10 @@ echo Building standalone executable...
 pyinstaller mewgenics_manager.spec --noconfirm
 
 echo.
-if exist "dist\MewgenicsManager.exe" (
+if exist "dist\MewgenicsManager\MewgenicsManager.exe" (
     echo Build succeeded!
-    echo Executable: dist\MewgenicsManager.exe
+    echo Executable: dist\MewgenicsManager\MewgenicsManager.exe
+    echo Folder distribution: dist\MewgenicsManager\
 ) else (
     echo Build FAILED — check output above.
 )

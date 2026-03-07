@@ -1250,26 +1250,7 @@ def _normalize_trait_override(field: str, value) -> str:
 
 def _trait_numeric_override(field: str, value):
     label = _normalize_trait_override(field, value)
-    if label:
-        return _CALIBRATION_TRAIT_NUMERIC[field][label]
-    n = _safe_float(value)
-    if n is None:
-        return None
-    if field in ("aggression", "libido"):
-        if n <= 0.3333:
-            label = "low"
-        elif n <= 0.6667:
-            label = "average"
-        else:
-            label = "high"
-    elif field == "inbredness":
-        if n <= 0.3333:
-            label = "not"
-        elif n <= 0.6667:
-            label = "slightly"
-        else:
-            label = "moderately"
-    else:
+    if not label:
         return None
     return _CALIBRATION_TRAIT_NUMERIC[field][label]
 
@@ -1452,7 +1433,7 @@ def _load_blacklist(save_path: str, cats: list[Cat]):
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "♀/♂", "Room", "Status", "BL"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Risk%", "Gen", "Source", "Inbr"]
+COLUMNS   = ["Name", "♀/♂", "Room", "Status", "BL"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Risk%", "Gen", "Agg", "Lib", "Inbred", "Source", "Inbr"]
 COL_NAME  = 0
 COL_GEN   = 1
 COL_ROOM  = 2
@@ -1464,14 +1445,18 @@ COL_ABIL  = 13
 COL_MUTS  = 14
 COL_REL   = 15
 COL_AGE   = 16   # generation depth
-COL_SRC   = 17
-COL_INB   = 18
+COL_AGG   = 17
+COL_LIB   = 18
+COL_INBRD = 19
+COL_SRC   = 20
+COL_INB   = 21
 
 # Fixed pixel widths for narrow columns
 _W_STATUS = 62
 _W_STAT   = 34
 _W_GEN    = 28
 _W_REL    = 68
+_W_TRAIT  = 70
 _ZOOM_MIN = 70
 _ZOOM_MAX = 200
 _ZOOM_STEP = 10
@@ -1622,6 +1607,15 @@ class CatTableModel(QAbstractTableModel):
                 return f"{int(round(self._relation_for(cat)))}%"
             if col == COL_AGE:
                 return str(cat.generation)
+            if col == COL_AGG:
+                label = _trait_label_from_value("aggression", cat.aggression)
+                return label if label else "—"
+            if col == COL_LIB:
+                label = _trait_label_from_value("libido", cat.libido)
+                return label if label else "—"
+            if col == COL_INBRD:
+                label = _trait_label_from_value("inbredness", cat.inbredness)
+                return label if label else "—"
             if col == COL_SRC:
                 pa, pb = cat.parent_a, cat.parent_b
                 if pa is None and pb is None:
@@ -1644,6 +1638,12 @@ class CatTableModel(QAbstractTableModel):
                 return self._relation_for(cat) if self._focus_cat is not None else -1.0
             if col == COL_AGE:
                 return cat.generation
+            if col == COL_AGG:
+                return cat.aggression if cat.aggression is not None else -1.0
+            if col == COL_LIB:
+                return cat.libido if cat.libido is not None else -1.0
+            if col == COL_INBRD:
+                return cat.inbredness if cat.inbredness is not None else -1.0
             return self.data(index, Qt.DisplayRole)
 
         elif role == Qt.BackgroundRole:
@@ -1704,12 +1704,24 @@ class CatTableModel(QAbstractTableModel):
                 return "\n".join(cat.mutations)
             if col == COL_ABIL and cat.abilities:
                 return "\n".join(cat.abilities)
+            if col == COL_AGG:
+                if cat.aggression is None:
+                    return "Aggression: unknown"
+                return f"Aggression: {cat.aggression:.3f} ({_trait_label_from_value('aggression', cat.aggression)})"
+            if col == COL_LIB:
+                if cat.libido is None:
+                    return "Libido: unknown"
+                return f"Libido: {cat.libido:.3f} ({_trait_label_from_value('libido', cat.libido)})"
+            if col == COL_INBRD:
+                if cat.inbredness is None:
+                    return "Inbredness: unknown"
+                return f"Inbredness: {cat.inbredness:.3f} ({_trait_label_from_value('inbredness', cat.inbredness)})"
 
         elif role == Qt.CheckStateRole and col == COL_BL:
             return Qt.Checked if cat.is_blacklisted else Qt.Unchecked
 
         elif role == Qt.TextAlignmentRole:
-            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_BL, COL_SUM, COL_REL, COL_AGE):
+            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_BL, COL_SUM, COL_REL, COL_AGE, COL_AGG, COL_LIB, COL_INBRD):
                 return Qt.AlignCenter
 
         return None
@@ -2149,6 +2161,48 @@ class CatDetailPanel(QWidget):
             grid.addWidget(sc, row_num, sum_col)
 
         mid.addWidget(grid_w)
+        mid.addWidget(_vsep())
+
+        # Inherited personality traits (based on parsed/calibrated parent values)
+        trait_col = QVBoxLayout()
+        trait_col.setSpacing(6)
+        trait_col.addWidget(_sec("INHERITED TRAITS"))
+
+        def _trait_text(field: str, value) -> str:
+            label = _trait_label_from_value(field, value)
+            return label if label else "unknown"
+
+        def _offspring_trait_text(field: str, va, vb) -> str:
+            if va is None or vb is None:
+                return "unknown"
+            lo = min(float(va), float(vb))
+            hi = max(float(va), float(vb))
+            lo_label = _trait_label_from_value(field, lo) or "unknown"
+            hi_label = _trait_label_from_value(field, hi) or "unknown"
+            if lo_label == hi_label:
+                return lo_label
+            return f"{lo_label} to {hi_label}"
+
+        for field, title in (
+            ("aggression", "Aggression"),
+            ("libido", "Libido"),
+            ("inbredness", "Inbredness"),
+        ):
+            va = getattr(a, field, None)
+            vb = getattr(b, field, None)
+            row = QHBoxLayout()
+            row.setSpacing(5)
+            row.addWidget(QLabel(f"{title}:", styleSheet="color:#555; font-size:10px;"))
+            row.addWidget(_chip(_trait_text(field, va)))
+            row.addWidget(QLabel("x", styleSheet="color:#444; font-size:10px;"))
+            row.addWidget(_chip(_trait_text(field, vb)))
+            row.addWidget(QLabel("->", styleSheet="color:#666; font-size:10px;"))
+            row.addWidget(_chip(_offspring_trait_text(field, va, vb)))
+            row.addStretch()
+            trait_col.addLayout(row)
+
+        trait_col.addStretch()
+        mid.addLayout(trait_col)
         mid.addWidget(_vsep())
 
         # Abilities column
@@ -3994,6 +4048,9 @@ class MainWindow(QMainWindow):
             COL_MUTS: 155,
             COL_REL: _W_REL,
             COL_AGE: 34,
+            COL_AGG: _W_TRAIT,
+            COL_LIB: _W_TRAIT,
+            COL_INBRD: _W_TRAIT,
             COL_INB: 38,
             **{c: _W_STAT for c in STAT_COLS},
         }
@@ -4262,8 +4319,15 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(COL_ROOM, QHeaderView.ResizeToContents)
 
         # Narrow fixed columns (gender, status, stats, sum)
-        for col, width in [(COL_GEN, _W_GEN), (COL_STAT, _W_STATUS), (COL_BL, 34),
-                           (COL_SUM, 38)] + [(c, _W_STAT) for c in STAT_COLS]:
+        for col, width in [
+            (COL_GEN, _W_GEN),
+            (COL_STAT, _W_STATUS),
+            (COL_BL, 34),
+            (COL_SUM, 38),
+            (COL_AGG, _W_TRAIT),
+            (COL_LIB, _W_TRAIT),
+            (COL_INBRD, _W_TRAIT),
+        ] + [(c, _W_STAT) for c in STAT_COLS]:
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self._table.setColumnWidth(col, width)
 
