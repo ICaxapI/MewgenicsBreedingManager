@@ -567,9 +567,10 @@ class Cat:
         self._uid_int = r.u64()            # cat's own unique id (seed)
         self.unique_id = hex(self._uid_int)
         self.name = r.utf16str()
-        _name_end = r.pos   # used below for reliable sex u16 read at _name_end+8
 
-        r.str()  # unknown string between name and parent refs
+        # Optional post-name tag string (empty for most cats). Some fields below
+        # are anchored to the byte immediately after this string.
+        r.str()
         personality_anchor = r.pos
 
         # Possible parent UIDs — fixed-position attempt.
@@ -590,7 +591,9 @@ class Cat:
         self.gender_token = (raw_gender or "").strip().lower()
         # Authoritative sex enum near the name block:
         #   0 = male, 1 = female, 2 = undefined/both (ditto-like)
-        sex_code = raw[_name_end + 8] if (_name_end + 9) <= len(raw) else None
+        # This byte follows the optional post-name tag string, so use the
+        # tag-aware anchor (personality_anchor), not name_end + fixed offset.
+        sex_code = raw[personality_anchor] if personality_anchor < len(raw) else None
         gender_from_code = {0: "male", 1: "female", 2: "?"}.get(sex_code)
         if gender_from_code:
             self.gender = gender_from_code
