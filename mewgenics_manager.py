@@ -2012,9 +2012,9 @@ class CatDetailPanel(QWidget):
                     if mw._source_model.cat_at(row) is cat:
                         idx = mw._source_model.index(row, COL_BL)
                         mw._source_model.dataChanged.emit(idx, idx, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+                        # Emit blacklistChanged which will trigger _on_blacklist_changed
+                        mw._source_model.blacklistChanged.emit()
                         break
-            if hasattr(mw, "_on_blacklist_changed"):
-                mw._on_blacklist_changed()
         blacklist_btn.clicked.connect(_toggle_blacklist)
         id_col.addWidget(blacklist_btn)
 
@@ -2033,6 +2033,8 @@ class CatDetailPanel(QWidget):
                     if mw._source_model.cat_at(row) is cat:
                         idx = mw._source_model.index(row, COL_MB)
                         mw._source_model.dataChanged.emit(idx, idx, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+                        # Emit blacklistChanged to save must_breed state
+                        mw._source_model.blacklistChanged.emit()
                         break
         must_breed_btn.clicked.connect(_toggle_must_breed)
         id_col.addWidget(must_breed_btn)
@@ -4206,6 +4208,7 @@ class MainWindow(QMainWindow):
             COL_GEN: _W_GEN,
             COL_STAT: _W_STATUS,
             COL_BL: 34,
+            COL_MB: 34,
             COL_SUM: 38,
             COL_ABIL: 180,
             COL_MUTS: 155,
@@ -4469,6 +4472,11 @@ class MainWindow(QMainWindow):
         self._table.verticalHeader().setVisible(False)
         self._table.setShowGrid(False)
         self._table.setWordWrap(False)
+        # Enable editing for checkboxes while keeping other cells read-only via model flags
+        self._table.setEditTriggers(
+            QAbstractItemView.CurrentChanged |
+            QAbstractItemView.SelectedClicked
+        )
 
         hh = self._table.horizontalHeader()
         hh.setStretchLastSection(False)  # we control stretch manually
@@ -4486,6 +4494,7 @@ class MainWindow(QMainWindow):
             (COL_GEN, _W_GEN),
             (COL_STAT, _W_STATUS),
             (COL_BL, 34),
+            (COL_MB, 34),
             (COL_SUM, 38),
             (COL_AGG, _W_TRAIT),
             (COL_LIB, _W_TRAIT),
